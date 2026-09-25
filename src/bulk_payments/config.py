@@ -16,8 +16,6 @@ class Settings(BaseSettings):
     lock_timeout_ms: int = 5_000
     statement_timeout_ms: int = 10_000
 
-    max_payments_per_request: int = 1_000
-
 
 @lru_cache
 def get_settings() -> Settings:
