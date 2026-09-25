@@ -7,12 +7,12 @@ they share. A Barrier releases them together so the transactions overlap.
 
 import random
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from bulk_payments import service
@@ -34,14 +34,6 @@ NET_FLOW_BY_FIRM = text("""
     LEFT JOIN payments p ON f.id IN (p.payer_firm_id, p.payee_firm_id)
     GROUP BY f.uuid
 """)
-
-
-@pytest.fixture
-def instances(database_url: str) -> Iterator[list[sessionmaker[Session]]]:
-    engines = [create_engine(database_url, pool_size=40, max_overflow=0) for _ in range(2)]
-    yield [sessionmaker(engine) for engine in engines]
-    for engine in engines:
-        engine.dispose()
 
 
 def request(payer: str, *lines: tuple[str, str]) -> BulkPaymentRequest:

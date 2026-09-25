@@ -77,6 +77,15 @@ def session_factory(engine: Engine) -> sessionmaker[Session]:
 
 
 @pytest.fixture
+def instances(database_url: str) -> Iterator[list[sessionmaker[Session]]]:
+    """Two engines with separate pools: two app instances sharing only the database."""
+    engines = [create_engine(database_url, pool_size=40, max_overflow=0) for _ in range(2)]
+    yield [sessionmaker(engine) for engine in engines]
+    for engine in engines:
+        engine.dispose()
+
+
+@pytest.fixture
 def client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
     def session_override() -> Iterator[Session]:
         with session_factory() as session:
