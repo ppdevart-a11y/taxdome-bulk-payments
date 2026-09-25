@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, types and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy
+      # Integration tests start their own PostgreSQL through testcontainers.
+      - name: Test
+        run: uv run pytest
+
+  stack:
+    name: Two replicas behind nginx, raced
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: docker compose up --build --detach --wait
+      - run: make seed
+      - name: Sample request returns 201
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/bulk_payments \
+            -H 'Content-Type: application/json' -d @scripts/sample_request.json)
+          test "$code" = 201
+      - name: Race demo
+        run: uv run python scripts/race_demo.py
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
