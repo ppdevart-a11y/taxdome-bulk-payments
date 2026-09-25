@@ -52,4 +52,8 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-markers = ["integration: needs a real PostgreSQL (started via testcontainers or DATABASE_URL)"]
+markers = ["integration: needs a real PostgreSQL (testcontainers, or TEST_DATABASE_URL)"]
+filterwarnings = [
+    # Starlette's TestClient now prefers httpx2; httpx still works and is what we pin.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
