@@ -62,6 +62,4 @@ class IdempotencyKey(Base):
     key: Mapped[str] = mapped_column(Text, primary_key=True)
     request_fingerprint: Mapped[str] = mapped_column(Text)
     response_body: Mapped[dict[str, Any]] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
