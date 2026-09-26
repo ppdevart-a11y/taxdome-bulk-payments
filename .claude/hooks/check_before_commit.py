@@ -6,20 +6,30 @@ import re
 import subprocess
 import sys
 
-GIT_COMMIT = re.compile(r"(?:^|[\s;&|(])git\s+(?:-\S+\s+(?:\S+\s+)?)*commit(?:\s|$)")
+# Any `git … commit` on a line. A false positive costs one extra make check; a miss skips the gate.
+GIT_COMMIT = re.compile(r"(?:^|[\s;&|(/\"'`])git(?:\s.*)?\scommit(?:\s|$)", re.MULTILINE)
 
-command = json.load(sys.stdin)["tool_input"]["command"]
-if not GIT_COMMIT.search(command):
-    sys.exit(0)
 
-gate = subprocess.run(
-    ["make", "check"],  # noqa: S607
-    cwd=os.environ["CLAUDE_PROJECT_DIR"],
-    capture_output=True,
-    text=True,
-    check=False,
-)
-if gate.returncode != 0:
-    output = (gate.stdout + gate.stderr)[-4000:]
-    sys.stderr.write(f"Commit blocked: make check failed. Fix it and retry.\n\n{output}\n")
-    sys.exit(2)
+def is_commit(command: str) -> bool:
+    return GIT_COMMIT.search(command) is not None
+
+
+def main() -> None:
+    command = json.load(sys.stdin)["tool_input"]["command"]
+    if not is_commit(command):
+        return
+    gate = subprocess.run(
+        ["make", "check"],  # noqa: S607
+        cwd=os.environ["CLAUDE_PROJECT_DIR"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if gate.returncode != 0:
+        output = (gate.stdout + gate.stderr)[-4000:]
+        sys.stderr.write(f"Commit blocked: make check failed. Fix it and retry.\n\n{output}\n")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
