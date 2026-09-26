@@ -21,12 +21,12 @@ make seed       # the three firms from the brief
 make sample     # POST scripts/sample_request.json through nginx -> 201
 make balances   # Pinecrest 36,748.75 | Lopez 1,700.75 | Nair 14,050.50
 make demo       # race both replicas concurrently, then check invariants
-make test       # 82 tests; integration tests start their own Postgres
+make test       # 89 tests; integration tests start their own Postgres
 make lint       # ruff + mypy --strict
 make down       # stop and delete the volume
 ```
 
-Interactive API docs: <http://localhost:8080/docs>. Sending `make sample` two more times still succeeds; the 4th attempt returns 422, because $50,000 covers the $13,251.25 sample three times but not four.
+Interactive API docs: <http://localhost:8080/docs>. The request body is pre-filled with the brief's sample, so **Try it out → Execute** works right after `make seed`. Sending the sample two more times still succeeds; the 4th attempt returns 422, because $50,000 covers the $13,251.25 sample three times but not four. With plain curl, send `-H 'Content-Type: application/json'`; without it the API answers 415, not a denial.
 
 Output of `make demo` (two replicas, requests fired simultaneously):
 
@@ -58,10 +58,11 @@ Idempotency-Key: 7c1d…            (optional, see below)
 | **422** | `unknown_firm` | The payer or a payee doesn't exist. `details.unknown_firm_uuids` lists them. |
 | **422** | `validation_error` | Bad amount, uuid or description, a self-payment, an unknown field, or 0 or more than 1000 payments. `details` has field paths such as `payments.0.amount`. |
 | **422** | `idempotency_key_reused` | The same key was sent with a different request. |
-| **400** | `invalid_json` | The body isn't JSON. |
+| **400** | `invalid_json` | The body isn't valid JSON. |
+| **415** | `unsupported_media_type` | The body wasn't sent as `application/json`, for example `curl -d` without the header. |
 | **503** | `firm_busy` | A firm stayed locked past `lock_timeout` (5 s). Includes `Retry-After: 1`, and a retry is safe. |
 
-Every error has the same shape: `{"error": {"code", "message", "details"}}`. `GET /health` checks database connectivity for the load balancer.
+Every error has the same shape: `{"error": {"code", "message", "details"}}`, including 404, 405 and unexpected 500s, which never expose internals. `GET /health` checks database connectivity for the load balancer. nginx accepts bodies up to 8 MB, enough for the largest valid request.
 
 ## How it works
 
@@ -124,13 +125,13 @@ Migrations run as a one-shot `migrate` service before any replica starts, so rep
 
 ## Testing
 
-82 tests. Everything that touches the database runs against real PostgreSQL through testcontainers, because locking and constraint behaviour is the thing under test and SQLite can't reproduce it.
+89 tests. Everything that touches the database runs against real PostgreSQL through testcontainers, because locking and constraint behaviour is the thing under test and SQLite can't reproduce it.
 
 | File | Tests | What it proves |
 |---|---|---|
 | `unit/test_money.py` | 38 | Exact parsing and formatting; Unicode-digit, trailing-newline, exponent and float traps |
 | `unit/test_schemas.py` | 20 | Strict request contract: unknown fields, limits, self-payment, NUL bytes |
-| `integration/test_api.py` | 12 | The brief's exact balances; all-or-nothing denial at 1 cent over; exact-balance payout; unknown firms; error envelope |
+| `integration/test_api.py` | 19 | The brief's exact balances; all-or-nothing denial at 1 cent over; exact-balance payout; unknown firms; 415 for non-JSON; error envelope for 400/404/405/422/500 |
 | `integration/test_concurrency.py` | 4 | No overdraft (20 parallel requests against 6 × funds); no deadlock with retries disabled; conservation and reconciliation under a random storm; hot row returns 503 |
 | `integration/test_idempotency.py` | 8 | Replay; re-spelled replay; key reuse returns 422; declines aren't remembered; per-payer scope; 10 concurrent duplicates pay once |
 
@@ -144,10 +145,23 @@ The concurrency tests use **two separate engines**, standing in for two instance
 
 CI (`.github/workflows/ci.yml`) runs lint, types and tests. A second job boots the Compose stack, sends the sample through nginx and runs the race demo.
 
+**Browser end to end.** I drove Swagger UI on the running stack with `playwright-cli`, through nginx:
+- Executing the pre-filled sample 4 times gave 201, 201, 201 and then 422 `insufficient_funds`, with $10,246.25 available.
+- After a reseed, two executions with the same `Idempotency-Key` gave 201, then 201 with `idempotent-replayed: true`. The database then held exactly $36,748.75, $1,700.75 and $14,050.50, with 3 payments.
+- A `text/plain` POST from the page was refused with 415. `/health` returned 200. There were no console errors.
+
+**Edge cases on the live stack:**
+- Unknown routes and wrong methods return the error envelope.
+- The largest valid request, 1000 payments with 1000-character descriptions (6.1 MB of JSON), returns 201.
+- A 9 MB body is stopped by nginx with 413.
+
 ## Issues I ran into
 
 - **nginx sent every sequential request to the same replica.** Each nginx worker process keeps its own round-robin position, so requests on fresh connections kept landing on the first upstream. A shared `zone` in the upstream fixed it, and the demo now shows a 20/20 split.
 - **The CI stack job would have failed on a fresh database.** Migrations create empty tables, so the sample returned 422 `unknown_firm` until the data was seeded. I caught this by replaying the job locally from `docker compose down -v`, before pushing it.
+- **`curl -d @sample_request.json` without a `Content-Type` header got a confusing 422.** curl then sends `application/x-www-form-urlencoded`, FastAPI leaves the body unparsed, and validation said "Input should be a valid dictionary". On an endpoint where 422 means *denied*, that reads like a rejection. The endpoint now answers 415 with a message naming the header to send. I found this while probing the live stack the way a reviewer would.
+- **nginx's default 1 MB body limit was below the API's own limits.** A valid request can reach about 6 MB (1000 payments with 1000-character descriptions, and JSON escaping takes up to 6 bytes per character). nginx would have rejected it with 413 before it reached the app. I raised the limit to 8 MB and tested it with that exact request.
+- **Swagger UI pre-filled random UUIDs**, so "Try it out" on seeded data returned `unknown_firm`. It now pre-fills the brief's sample.
 - **Starlette's test client now warns that `httpx` is deprecated in favour of `httpx2`.** I kept the pinned `httpx` and filtered only that exact warning; moving over is listed under improvements.
 
 **Pitfalls I designed around, each pinned by a test:**

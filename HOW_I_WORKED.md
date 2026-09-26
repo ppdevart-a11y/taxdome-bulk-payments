@@ -8,9 +8,9 @@ I used one AI tool: **Claude Code** in the VS Code extension, running Claude Opu
 |---|---|
 | Planning | Plan mode. It read the repo and history, asked clarifying questions (reset scope, schema, stack, tools), and wrote a step-by-step plan that I approved before any code changed. |
 | Implementation | It wrote the service, API, migration, tests, Docker/Compose, CI and docs, one step per commit. |
-| Verification | It ran lint, mypy and the full test suite against real PostgreSQL after every step. It brought up the two-replica stack, sent the sample through nginx and ran the race demo. |
+| Verification | It ran lint, mypy and the full test suite against real PostgreSQL after every step. It brought up the two-replica stack, sent the sample through nginx and ran the race demo. It also drove Swagger UI in a real browser with `playwright-cli`: 201 three times, then 422, an idempotent replay, and the brief's exact balances in the database. |
 | Proving the tests | It broke the code on purpose (removed the row lock, reordered the locks, moved the idempotency lookup) to confirm each test fails for the right reason, then restored it. |
-| Review | It re-read its own output before each commit. This caught a CI job that would have queried an unseeded database, and a README claim that didn't match what had actually happened. |
+| Review | It re-read its own output before each commit. This caught a CI job that would have queried an unseeded database, and a README claim that didn't match what had actually happened. A final audit against the brief, probing the live stack the way a reviewer would, found three more gaps, which it fixed: a confusing 422 for `curl -d` without a Content-Type, nginx's body limit sitting below the API's own limits, and Swagger UI pre-filled with firms that don't exist. |
 
 My part was scope and direction: which brief to follow, keeping the existing work, the stack, the deliverables, and the bar for commit quality. I also approved the plan. The engineering decisions and their reasoning are Claude's, and they're recorded in the commit messages and the README.
 
@@ -31,8 +31,7 @@ Read it top to bottom. Each commit is one step, and its message explains why.
 | 9 | Add CI running lint, types and tests against Postgres | Tests plus a job that boots and races the stack. |
 | 10 | Write README as a pull request description | Design, alternatives, issues, assumptions, next steps. |
 | 11 | Document tools, commit history and the prompts for each step | This file. |
-
-Commits 1–4 were produced in an earlier Claude Code session from the same brief. The prompts below are from the session that planned and built commits 5–11.
+| 12 | Return 415 for non-JSON bodies and verify the stack in a browser | A final audit against the brief, and a browser run through nginx. |
 
 ## Prompts
 
@@ -72,3 +71,6 @@ Prompts tidied for readability.
 - brought up two replicas behind nginx and raced them (40 simultaneous overdraft attempts gave exactly 6 × 201);
 - replayed both CI jobs locally from a clean database before committing;
 - wrote the README as a PR description.
+
+**8. Final audit**
+> Before we call it done, recheck everything against the brief. Then verify the running stack end to end in a real browser with playwright-cli; passing tests alone aren't enough.

@@ -1,8 +1,11 @@
+from collections.abc import Mapping
+from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from bulk_payments.api import router
 from bulk_payments.errors import ServiceError
@@ -14,7 +17,7 @@ def _error(
     code: str,
     message: str,
     details: dict[str, Any] | list[dict[str, Any]] | None = None,
-    headers: dict[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
     body = ErrorResponse(error=ErrorDetail(code=code, message=message, details=details))
     return JSONResponse(body.model_dump(exclude_none=True), status_code, headers=headers)
@@ -33,6 +36,17 @@ def create_app() -> FastAPI:
         retryable = exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
         headers = {"Retry-After": "1"} if retryable else None
         return _error(exc.status_code, exc.code, exc.message, exc.details, headers)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(_: Request, exc: Exception) -> JSONResponse:
+        # Starlette still logs the traceback; the client gets the usual envelope, no internals.
+        return _error(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "unexpected error")
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # 404, 405 and friends use the same envelope as every other error.
+        code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_")
+        return _error(exc.status_code, code, str(exc.detail), headers=exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:

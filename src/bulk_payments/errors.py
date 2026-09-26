@@ -30,3 +30,10 @@ class FirmBusy(ServiceError):
 
     status_code = 503
     code = "firm_busy"
+
+
+class UnsupportedMediaType(ServiceError):
+    """The body wasn't sent as JSON. Kept apart from 422, which means "denied"."""
+
+    status_code = 415
+    code = "unsupported_media_type"

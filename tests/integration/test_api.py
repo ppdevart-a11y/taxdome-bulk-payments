@@ -1,9 +1,14 @@
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Iterator
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
+from sqlalchemy.orm import Session
 
+from bulk_payments.db import get_session
+from bulk_payments.main import create_app
 from bulk_payments.money import format_cents
 from tests.integration.conftest import LOPEZ, NAIR, PINECREST, SAMPLE_REQUEST, SEED_BALANCES
 
@@ -157,3 +162,59 @@ def test_health(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [None, "text/plain", "application/x-www-form-urlencoded"],  # curl -d sends the last one
+)
+def test_body_not_sent_as_json_is_a_415_not_a_denial(
+    client: TestClient, payments: Payments, content_type: str | None
+) -> None:
+    headers = {"Content-Type": content_type} if content_type else {}
+
+    response = client.post("/bulk_payments", content=json.dumps(SAMPLE_REQUEST), headers=headers)
+
+    assert response.status_code == 415
+    assert response.json()["error"]["code"] == "unsupported_media_type"
+    assert payments() == []
+
+
+def test_json_with_charset_is_accepted(client: TestClient) -> None:
+    response = client.post(
+        "/bulk_payments",
+        content=json.dumps(SAMPLE_REQUEST),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    assert response.status_code == 201
+
+
+def test_unknown_route_and_wrong_method_use_the_error_envelope(client: TestClient) -> None:
+    not_found = client.get("/nope")
+    wrong_method = client.get("/bulk_payments")
+
+    assert not_found.status_code == 404
+    assert not_found.json() == {"error": {"code": "not_found", "message": "Not Found"}}
+    assert wrong_method.status_code == 405
+    assert wrong_method.json()["error"]["code"] == "method_not_allowed"
+    assert wrong_method.headers["Allow"] == "POST"
+
+
+def test_unexpected_errors_use_the_envelope_without_internals() -> None:
+    def broken_session() -> Iterator[Session]:
+        raise RuntimeError("secret connection string")
+        yield  # pragma: no cover
+
+    app = create_app()
+    app.dependency_overrides[get_session] = broken_session
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/bulk_payments", json=SAMPLE_REQUEST)
+
+    assert response.status_code == 500
+    assert response.json() == {"error": {"code": "internal_error", "message": "unexpected error"}}
+
+
+def test_swagger_example_is_the_brief_sample(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    content = schema["paths"]["/bulk_payments"]["post"]["requestBody"]["content"]
+    assert content["application/json"]["examples"]["brief"]["value"] == SAMPLE_REQUEST
