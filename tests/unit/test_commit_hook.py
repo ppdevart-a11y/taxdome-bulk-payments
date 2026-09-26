@@ -37,6 +37,15 @@ hook = load_hook()
         "git rebase main",
         "git am fix.patch",
         "git pull origin main",
+        "git commit&&git push",
+        "git commit;git push",
+        "git commit|tee commit.log",
+        "$(which git) commit -m x",
+        '"$(command -v git)" commit -m x',
+        'git "commit" -m x',
+        "git 'commit' -m x",
+        "\\git commit -m x",
+        "git -C repo \\\n  commit -m x",  # continued on the next line
     ],
 )
 def test_commands_that_create_commits_run_the_gate(command: str) -> None:
@@ -50,6 +59,7 @@ def test_commands_that_create_commits_run_the_gate(command: str) -> None:
         "git commit-tree abc123",
         "git merge-base main HEAD",
         "git log --oneline",
+        "git log --grep=commit",
         "echo committed",
         "legit commit",
         "uv run pytest",

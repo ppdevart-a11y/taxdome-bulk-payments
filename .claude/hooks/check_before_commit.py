@@ -6,16 +6,20 @@ import re
 import subprocess
 import sys
 
-# Any git command that creates commits, on any line. A false positive costs one extra make check;
-# a miss skips the gate.
+# A git command that creates commits, on any line: with options, a path, quotes, a line
+# continuation, $(which git), or chained with ; && or |. A shell variable or an alias can
+# still hide one; CI runs the same gate. A false positive costs one extra make check; a miss
+# skips the gate.
 CREATES_COMMITS = re.compile(
-    r"(?:^|[\s;&|(/\"'`])git(?:\s.*)?\s(?:commit|merge|revert|cherry-pick|rebase|am|pull)(?:\s|$)",
+    r"(?:^|[\s;&|(/\\!\"'`])git[)\"'`]*(?:\s.*)?\s[\"']?"
+    r"(?:commit|merge|revert|cherry-pick|rebase|am|pull)[\"']?(?![\w-])",
     re.MULTILINE,
 )
 
 
 def creates_commits(command: str) -> bool:
-    return CREATES_COMMITS.search(command) is not None
+    # A backslash at the end of a line continues the command on the next one.
+    return CREATES_COMMITS.search(command.replace("\\\n", " ")) is not None
 
 
 def main() -> None:
