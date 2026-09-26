@@ -22,7 +22,7 @@ I used one AI tool: **Claude Code** in the VS Code extension, running Claude Opu
 
 ## Commit history
 
-Read it top to bottom. Each commit is one step, and every message after the scaffold explains why. Commits 13–16 were made together once I had approved them, and so were 17–22.
+Read it top to bottom. Each commit is one step, and every message after the scaffold explains why. Commits 13–16, 17–22 and 23–24 were each made together, once I had approved them.
 
 | # | Commit | What it shows |
 |---|---|---|
@@ -48,6 +48,8 @@ Read it top to bottom. Each commit is one step, and every message after the scaf
 | 20 | Pin the transaction's untested invariants with tests | Four mutations that left the suite green now fail it. |
 | 21 | Catch every spelling of git commit in the agent hook | `git -C "…" commit` no longer slips past the gate. |
 | 22 | Correct the docs after the pre-submission audit | A neutral voice, the real demo output, and claims that match the code. |
+| 23 | Pin the CI runner image and give each job its own uv cache | A CI run without warnings, and no surprise when GitHub moves `ubuntu-latest`. |
+| 24 | Add a CI status badge to the README | The latest run's status, one click from the top of the README. |
 
 ## Prompts
 

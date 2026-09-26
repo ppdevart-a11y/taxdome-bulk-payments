@@ -1,5 +1,7 @@
 # Bulk payments: one firm pays many firms, all or nothing
 
+[![CI](https://github.com/ppdevart-a11y/taxdome-bulk-payments/actions/workflows/ci.yml/badge.svg)](https://github.com/ppdevart-a11y/taxdome-bulk-payments/actions/workflows/ci.yml)
+
 ## Summary
 
 `POST /bulk_payments` takes a list of payments from one payer firm and either:
