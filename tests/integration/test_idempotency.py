@@ -19,10 +19,10 @@ from tests.integration.conftest import (
     PINECREST,
     SAMPLE_REQUEST,
     SEED_BALANCES,
+    Balances,
+    Payments,
+    pay,
 )
-
-Balances = Callable[[], dict[str, int]]
-Payments = Callable[[], list[tuple[int, int, int, str]]]
 
 
 def post(client: TestClient, body: dict[str, Any], key: str | None = None) -> Any:
@@ -143,18 +143,9 @@ def test_concurrent_duplicates_pay_exactly_once(
     assert balances() == AFTER_ONE_SAMPLE
 
 
-def one_payment(payer: str, amount: str, payee: str) -> BulkPaymentRequest:
-    return BulkPaymentRequest.model_validate(
-        {
-            "payer_firm_uuid": payer,
-            "payments": [{"amount": amount, "payee_firm_uuid": payee, "description": "x"}],
-        }
-    )
-
-
 def test_replay_after_the_payer_spent_everything(client: TestClient, balances: Balances) -> None:
     # The money already moved: the retry must replay before a funds check sees an empty balance.
-    body = one_payment(LOPEZ, "500", NAIR).model_dump(mode="json")
+    body = pay(LOPEZ, ("500", NAIR))
 
     first = post(client, body, key="all-in")
     retry = post(client, body, key="all-in")
@@ -170,7 +161,8 @@ def test_same_key_with_different_bodies_at_once(
     instances: list[sessionmaker[Session]], balances: Balances, payments: Payments
 ) -> None:
     # One request wins the key. Its twins replay it; the other body is refused, never paid.
-    to_lopez, to_nair = one_payment(PINECREST, "1", LOPEZ), one_payment(PINECREST, "2", NAIR)
+    to_lopez = BulkPaymentRequest.model_validate(pay(PINECREST, ("1", LOPEZ)))
+    to_nair = BulkPaymentRequest.model_validate(pay(PINECREST, ("2", NAIR)))
     bodies = [to_lopez] * 5 + [to_nair] * 5
     barrier = threading.Barrier(len(bodies), timeout=30)
 
@@ -249,10 +241,10 @@ def test_a_key_reused_for_any_other_request_is_rejected(
 def test_the_same_description_in_another_unicode_form_is_a_replay(
     client: TestClient, payments: Payments
 ) -> None:
-    composed = one_payment(PINECREST, "1", LOPEZ).model_dump(mode="json")
-    composed["payments"][0]["description"] = "Café"
+    composed = pay(PINECREST, ("1", LOPEZ))
+    composed["payments"][0]["description"] = "Caf\u00e9"
     decomposed = copy.deepcopy(composed)
-    decomposed["payments"][0]["description"] = "Café"
+    decomposed["payments"][0]["description"] = "Cafe\u0301"
 
     first = post(client, composed, key="cafe")
     retry = post(client, decomposed, key="cafe")
@@ -265,7 +257,7 @@ def test_the_same_description_in_another_unicode_form_is_a_replay(
 
 def test_replay_after_a_payee_changed_its_uuid(client: TestClient, engine: Engine) -> None:
     # The key is looked up before any check on current state: the original request went through.
-    body = one_payment(PINECREST, "1", LOPEZ).model_dump(mode="json")
+    body = pay(PINECREST, ("1", LOPEZ))
     first = post(client, body, key="moved")
     with engine.begin() as connection:
         connection.execute(

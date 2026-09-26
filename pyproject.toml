@@ -37,16 +37,16 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
-ignore = ["S101"] # assert is fine in tests
 
 [tool.ruff.lint.per-file-ignores]
-"migrations/*" = ["S608"]
+"tests/*" = ["S101"] # assert is how pytest checks; production code must not rely on it
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["bulk_payments"]
+files = ["src", "tests", "scripts", "migrations", ".claude/hooks"]
 mypy_path = "src"
+explicit_package_bases = true
 plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]

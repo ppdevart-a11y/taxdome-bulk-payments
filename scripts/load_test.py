@@ -4,12 +4,15 @@ Seeds the three sample firms plus 200 more, runs each scenario for a fixed time
 with many concurrent clients through nginx, and reports throughput, latency and
 statuses. After every scenario it checks that total money is unchanged, no
 balance is negative, every balance reconciles with the payments table, and the
-payment rows written match the 201 responses. Exits non-zero if any check fails.
+payment rows written match the 201 responses exactly. Exits non-zero if any check
+fails. The four scenarios take about a minute and a half.
 
     uv run python scripts/load_test.py [--seconds 20] [--clients 64] [--chaos]
 
---chaos runs one longer scenario instead: it kills an app replica, brings it back and
-restarts Postgres, all under load, then checks that the service recovers.
+--chaos runs one 40-second scenario instead: it kills an app replica, brings it back
+and restarts Postgres, all under load, then checks that the service recovers. There,
+a request cut off by the chaos may have committed, so the rows written must cover
+the 201 responses, and any extra rows are reported.
 """
 
 import argparse
@@ -29,6 +32,8 @@ from typing import Any
 import httpx
 import psycopg
 
+from bulk_payments.money import format_cents
+
 BASE_URL = os.environ.get("DEMO_BASE_URL", "http://localhost:8080")
 DB_URL = os.environ.get(
     "DEMO_DATABASE_URL", "postgresql://postgres:postgres@localhost:55433/bulk_payments"
@@ -38,6 +43,11 @@ PINECREST = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"
 NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"
 EXTRA_FIRMS = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"load-firm-{n}")) for n in range(200)]
 EXTRA_BALANCE_CENTS = 100_000
+CHAOS_SECONDS = 40
+# When each chaos event happens, as a share of the run.
+KILL_REPLICA_AT, START_REPLICA_AT, RESTART_POSTGRES_AT = 0.25, 0.45, 0.60
+# How long Postgres gets to come back before every request must succeed again.
+POSTGRES_RECOVERY_SECONDS = 8
 
 Body = dict[str, Any]
 MakeRequest = Callable[[random.Random], tuple[Body, dict[str, str]]]
@@ -50,15 +60,11 @@ def check(ok: bool, message: str) -> None:
         failures.append(message)
 
 
-def dollars(cents: int) -> str:
-    return f"{cents // 100}.{cents % 100:02d}"
-
-
 def body(payer: str, lines: list[tuple[str, int]]) -> Body:
     return {
         "payer_firm_uuid": payer,
         "payments": [
-            {"amount": dollars(cents), "payee_firm_uuid": payee, "description": "load test"}
+            {"amount": format_cents(cents), "payee_firm_uuid": payee, "description": "load test"}
             for payee, cents in lines
         ],
     }
@@ -127,9 +133,9 @@ def docker(*args: str) -> None:
 async def chaos(run: Run, seconds: float) -> list[tuple[float, str]]:
     events = []
     for at, label, action in [
-        (0.25, "kill app replica 1", ("kill", "bulk-payments-app-1")),
-        (0.45, "start app replica 1", ("start", "bulk-payments-app-1")),
-        (0.60, "restart Postgres", ("restart", "bulk-payments-postgres-1")),
+        (KILL_REPLICA_AT, "kill app replica 1", ("kill", "bulk-payments-app-1")),
+        (START_REPLICA_AT, "start app replica 1", ("start", "bulk-payments-app-1")),
+        (RESTART_POSTGRES_AT, "restart Postgres", ("restart", "bulk-payments-postgres-1")),
     ]:
         await asyncio.sleep(max(0.0, run.started + at * seconds - time.monotonic()))
         events.append((time.monotonic() - run.started, label))
@@ -144,7 +150,7 @@ def percentile(sorted_values: list[float], share: float) -> float:
 def query(sql: str) -> list[tuple[Any, ...]]:
     # A fresh connection per check, so the chaos run's Postgres restart can't break verification.
     with psycopg.connect(DB_URL, autocommit=True) as db:
-        return db.execute(sql).fetchall()  # type: ignore[arg-type]
+        return db.execute(sql).fetchall()
 
 
 def snapshot() -> tuple[dict[str, int], int]:
@@ -173,7 +179,7 @@ def verify(base: dict[str, int], rows_before: int) -> int:
     return rows_after - rows_before
 
 
-def report(name: str, run: Run, seconds: float) -> Counter[int]:
+def report(run: Run, seconds: float) -> Counter[int]:
     statuses = Counter(status for _, status, _ in run.samples)
     latencies = sorted(elapsed for _, status, elapsed in run.samples if status)
     print(f"  requests: {len(run.samples):,} ({len(run.samples) / seconds:,.0f}/s)")
@@ -202,16 +208,16 @@ async def scenario(
         until = run.started + seconds
         rngs = [random.Random(n) for n in range(clients)]  # noqa: S311
         tasks = [worker(client, run, make, rng, until) for rng in rngs]
-        if chaotic:
-            events, *_ = await asyncio.gather(chaos(run, seconds), *tasks)
-            for at, label in events:
+        events = asyncio.create_task(chaos(run, seconds)) if chaotic else None
+        await asyncio.gather(*tasks)
+        if events is not None:
+            for at, label in await events:
                 print(f"  t={at:4.1f}s  {label}")
-        else:
-            await asyncio.gather(*tasks)
-    statuses = report(name, run, seconds)
+    statuses = report(run, seconds)
     if chaotic:
         # Postgres takes a few seconds to come back; after that every request must succeed again.
-        settled = [status for at, status, _ in run.samples if at > seconds * 0.60 + 8]
+        recovered_at = seconds * RESTART_POSTGRES_AT + POSTGRES_RECOVERY_SECONDS
+        settled = [status for at, status, _ in run.samples if at > recovered_at]
         check(bool(settled) and set(settled) <= {201, 422}, "recovered: only 201/422 afterwards")
     else:
         unexpected = {status: n for status, n in statuses.items() if status not in (201, 422)}
@@ -246,7 +252,7 @@ async def main() -> None:
     print(f"{len(base)} firms, {args.clients} clients")
     if args.chaos:
         name = "Chaos: kill a replica, bring it back, restart Postgres, all under load"
-        await scenario(name, spread, args.clients, 40, base, chaotic=True)
+        await scenario(name, spread, args.clients, CHAOS_SECONDS, base, chaotic=True)
     else:
         runs: list[tuple[str, MakeRequest]] = [
             ("1. Spread: random payers, 1-5 payees each", spread),
