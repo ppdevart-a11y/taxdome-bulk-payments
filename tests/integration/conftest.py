@@ -10,6 +10,7 @@ truncated before every test, so never point it at data you care about.
 import json
 import os
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,33 @@ NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"
 SEED_BALANCES = {PINECREST: 5_000_000, LOPEZ: 50_000, NAIR: 200_000}
 # Worked out by hand: the sample moves $13,251.25 from Pinecrest to Nair and Lopez.
 AFTER_ONE_SAMPLE = {PINECREST: 3_674_875, LOPEZ: 170_075, NAIR: 1_405_050}
+
+Balances = Callable[[], dict[str, int]]
+Payments = Callable[[], list[tuple[int, int, int, str]]]
+# (action, stage, times) -> a function that tells how many attempts reached the stage.
+InjectFailure = Callable[[str, str, int], Callable[[], int]]
+
+# Where an injected failure strikes. Both watch the idempotency key, the transaction's last write.
+FAILURE_STAGES = {
+    # Before COMMIT, where a real deadlock or a dropped connection would hit.
+    "on the last write": "CREATE TRIGGER injected_failure BEFORE INSERT ON idempotency_keys",
+    # Deferred: runs inside COMMIT, after every write went through.
+    "during COMMIT": (
+        "CREATE CONSTRAINT TRIGGER injected_failure AFTER INSERT ON idempotency_keys "
+        "DEFERRABLE INITIALLY DEFERRED"
+    ),
+}
+
+
+def pay(payer: str, *lines: tuple[str, str]) -> dict[str, Any]:
+    """A request body: `payer` pays each (amount, payee) line."""
+    return {
+        "payer_firm_uuid": payer,
+        "payments": [
+            {"amount": amount, "payee_firm_uuid": payee, "description": f"payment {i}"}
+            for i, (amount, payee) in enumerate(lines)
+        ],
+    }
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -92,20 +120,77 @@ def instances(database_url: str) -> Iterator[list[sessionmaker[Session]]]:
         engine.dispose()
 
 
-@pytest.fixture
-def client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
+@contextmanager
+def app_client(
+    session_factory: sessionmaker[Session], *, raise_server_exceptions: bool = True
+) -> Iterator[TestClient]:
+    """The app, with its database sessions drawn from `session_factory`."""
+
     def session_override() -> Iterator[Session]:
         with session_factory() as session:
             yield session
 
     app = create_app()
     app.dependency_overrides[get_session] = session_override
-    with TestClient(app) as client:
+    with TestClient(app, raise_server_exceptions=raise_server_exceptions) as client:
         yield client
 
 
 @pytest.fixture
-def balances(engine: Engine) -> Callable[[], dict[str, int]]:
+def client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
+    with app_client(session_factory) as client:
+        yield client
+
+
+@pytest.fixture
+def lenient_client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
+    """Like `client`, but an unexpected error comes back as the 500 a real client would see."""
+    with app_client(session_factory, raise_server_exceptions=False) as client:
+        yield client
+
+
+@pytest.fixture
+def inject_failure(engine: Engine) -> Iterator[InjectFailure]:
+    """Run a PL/pgSQL `action` the first `times` times a request reaches `stage`.
+
+    The trigger watches the idempotency key, so the request must send one.
+    """
+
+    def install(action: str, stage: str, times: int) -> Callable[[], int]:
+        with engine.begin() as connection:
+            connection.execute(text("CREATE SEQUENCE injected_attempts"))
+            connection.execute(
+                text(
+                    "CREATE FUNCTION injected_failure() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                    f"BEGIN IF nextval('injected_attempts') <= {times} THEN {action}; END IF; "
+                    "RETURN NEW; END $$"
+                )
+            )
+            connection.execute(
+                text(f"{FAILURE_STAGES[stage]} FOR EACH ROW EXECUTE FUNCTION injected_failure()")
+            )
+
+        def attempts() -> int:
+            with engine.connect() as connection:
+                reached = connection.execute(
+                    text(
+                        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END "
+                        "FROM injected_attempts"
+                    )
+                )
+                return int(reached.scalar_one())
+
+        return attempts
+
+    yield install
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER IF EXISTS injected_failure ON idempotency_keys"))
+        connection.execute(text("DROP FUNCTION IF EXISTS injected_failure()"))
+        connection.execute(text("DROP SEQUENCE IF EXISTS injected_attempts"))
+
+
+@pytest.fixture
+def balances(engine: Engine) -> Balances:
     def read() -> dict[str, int]:
         with engine.connect() as connection:
             rows = connection.execute(text("SELECT uuid, balance_cents FROM firms"))
@@ -115,7 +200,7 @@ def balances(engine: Engine) -> Callable[[], dict[str, int]]:
 
 
 @pytest.fixture
-def payments(engine: Engine) -> Callable[[], list[tuple[int, int, int, str]]]:
+def payments(engine: Engine) -> Payments:
     def read() -> list[tuple[int, int, int, str]]:
         with engine.connect() as connection:
             rows = connection.execute(

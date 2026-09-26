@@ -36,6 +36,7 @@ _RETRYABLE = (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailu
 # lock_timeout / statement_timeout fired: a firm is locked by long-running work.
 _BUSY = (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled)
 # The connection or the transaction ended under us: Postgres restarting, the idle timeout.
+# psycopg makes the errors above OperationalErrors too, so they must be matched first.
 _LOST = (psycopg.OperationalError, psycopg.errors.IdleInTransactionSessionTimeout)
 
 # Debit and credits in one round trip. Relative updates, so the statement is
@@ -54,37 +55,47 @@ class Outcome:
     replayed: bool = False
 
 
+@dataclass(frozen=True)
+class _Key:
+    """An Idempotency-Key and the fingerprint of the request it came with."""
+
+    value: str
+    fingerprint: str
+
+
 def create_bulk_payment(
     session: Session, request: BulkPaymentRequest, idempotency_key: str | None = None
 ) -> Outcome:
+    # Hashing needs no database: done once, and before any lock is taken.
+    key = None if idempotency_key is None else _Key(idempotency_key, _fingerprint(request))
     attempt = 1
     while True:
         committing = False
         try:
             with session.begin():
-                outcome = _transfer(session, request, idempotency_key)
+                outcome = _transfer(session, request, key)
                 committing = True
             return outcome
         except PoolTimeoutError as exc:
             # No connection came free, so nothing reached the database.
             raise ServiceBusy("the service is busy, retry shortly") from exc
         except DBAPIError as exc:
-            if isinstance(exc.orig, _BUSY):
-                raise FirmBusy(
-                    "a firm in this request is busy with another payment, retry shortly"
-                ) from exc
             if isinstance(exc.orig, _RETRYABLE) and attempt < _MAX_ATTEMPTS:
                 attempt += 1
                 continue
+            # Postgres rolled the whole transaction back for each of these, even at COMMIT.
+            if isinstance(exc.orig, _RETRYABLE + _BUSY):
+                raise FirmBusy(
+                    "a firm in this request is busy with another payment, retry shortly"
+                ) from exc
             if isinstance(exc.orig, _LOST) and not committing:
                 # Failed before COMMIT, with every write already flushed: all of it rolled back.
                 raise ServiceBusy("the database is unavailable, retry shortly") from exc
+            # Anything else, including a connection lost during COMMIT: the outcome is unknown.
             raise
 
 
-def _transfer(
-    session: Session, request: BulkPaymentRequest, idempotency_key: str | None
-) -> Outcome:
+def _transfer(session: Session, request: BulkPaymentRequest, key: _Key | None) -> Outcome:
     settings = get_settings()
     # SET LOCAL cannot take bind parameters; set_config(..., is_local => true) is equivalent.
     # The idle timeout ends a transaction whose instance stalls while holding the locks.
@@ -117,19 +128,18 @@ def _transfer(
     if payer is None:
         raise UnknownFirms("unknown firm uuid", {"unknown_firm_uuids": unknown})
 
-    fingerprint = _fingerprint(request)
-    if idempotency_key is not None:
+    if key is not None:
         # Race-free without extra locking: we hold the payer's row lock, and every
         # request from this payer takes it first. A concurrent duplicate therefore
         # waits for the original to commit, then finds its key here and replays.
         # It runs before the checks on current state, so a retry of a paid request replays.
         stored = session.execute(
             select(IdempotencyKey.request_fingerprint, IdempotencyKey.response_body).where(
-                IdempotencyKey.payer_firm_id == payer.id, IdempotencyKey.key == idempotency_key
+                IdempotencyKey.payer_firm_id == payer.id, IdempotencyKey.key == key.value
             )
         ).one_or_none()
         if stored is not None:
-            if stored.request_fingerprint != fingerprint:
+            if stored.request_fingerprint != key.fingerprint:
                 raise IdempotencyKeyReused(
                     "this Idempotency-Key was already used for a different request"
                 )
@@ -138,7 +148,9 @@ def _transfer(
     if unknown:
         raise UnknownFirms("unknown firm uuid", {"unknown_firm_uuids": unknown})
 
-    total = request.total_cents
+    # Each line's cents, converted once: the debit is their sum, so it always equals the credits.
+    cents = [payment.amount_cents for payment in request.payments]
+    total = sum(cents)
     # The balance was read under the lock: nobody can spend it before we commit.
     if total > payer.balance_cents:
         raise InsufficientFunds(
@@ -148,8 +160,8 @@ def _transfer(
 
     deltas: defaultdict[int, int] = defaultdict(int)
     deltas[payer.id] -= total
-    for payment in request.payments:
-        deltas[by_uuid[str(payment.payee_firm_uuid)].id] += payment.amount_cents
+    for payment, line_cents in zip(request.payments, cents, strict=True):
+        deltas[by_uuid[str(payment.payee_firm_uuid)].id] += line_cents
     session.execute(_APPLY_DELTAS, {"firm_ids": list(deltas), "cents": list(deltas.values())})
 
     payment_ids = session.scalars(
@@ -158,10 +170,10 @@ def _transfer(
             {
                 "payer_firm_id": payer.id,
                 "payee_firm_id": by_uuid[str(payment.payee_firm_uuid)].id,
-                "amount_cents": payment.amount_cents,
+                "amount_cents": line_cents,
                 "description": payment.description,
             }
-            for payment in request.payments
+            for payment, line_cents in zip(request.payments, cents, strict=True)
         ],
     ).all()
 
@@ -172,21 +184,23 @@ def _transfer(
             PaymentOut(
                 id=payment_id,
                 payee_firm_uuid=str(payment.payee_firm_uuid),
-                amount=format_cents(payment.amount_cents),
+                amount=format_cents(line_cents),
                 description=payment.description,
             )
-            for payment_id, payment in zip(payment_ids, request.payments, strict=True)
+            for payment_id, payment, line_cents in zip(
+                payment_ids, request.payments, cents, strict=True
+            )
         ],
     )
-    if idempotency_key is not None:
+    if key is not None:
         # Same transaction as the payments: the key exists if and only if they do.
         # Declined requests roll back and store nothing, so a retry after a
         # top-up is judged afresh.
         session.add(
             IdempotencyKey(
                 payer_firm_id=payer.id,
-                key=idempotency_key,
-                request_fingerprint=fingerprint,
+                key=key.value,
+                request_fingerprint=key.fingerprint,
                 response_body=response.model_dump(mode="json"),
             )
         )

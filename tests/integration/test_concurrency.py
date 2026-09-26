@@ -8,13 +8,13 @@ they share. A Barrier releases them together so the transactions overlap.
 import random
 import threading
 import time
-from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -25,15 +25,19 @@ from bulk_payments.money import format_cents
 from bulk_payments.schemas import BulkPaymentRequest
 from tests.integration.conftest import (
     AFTER_ONE_SAMPLE,
+    FAILURE_STAGES,
     LOPEZ,
     NAIR,
     PINECREST,
     SAMPLE_REQUEST,
     SEED_BALANCES,
+    Balances,
+    InjectFailure,
+    Payments,
+    pay,
 )
 
 FIRMS = [PINECREST, LOPEZ, NAIR]
-Balances = Callable[[], dict[str, int]]
 
 # Received minus paid, per firm, according to the payments table.
 NET_FLOW_BY_FIRM = text("""
@@ -47,15 +51,7 @@ NET_FLOW_BY_FIRM = text("""
 
 
 def request(payer: str, *lines: tuple[str, str]) -> BulkPaymentRequest:
-    return BulkPaymentRequest.model_validate(
-        {
-            "payer_firm_uuid": payer,
-            "payments": [
-                {"amount": amount, "payee_firm_uuid": payee, "description": "concurrency test"}
-                for amount, payee in lines
-            ],
-        }
-    )
+    return BulkPaymentRequest.model_validate(pay(payer, *lines))
 
 
 def run_concurrently(
@@ -182,25 +178,25 @@ def test_statement_timeout_is_503(
 
 
 def test_a_stalled_instance_releases_its_locks(
-    instances: list[sessionmaker[Session]],
+    session_factory: sessionmaker[Session],
+    database_url: str,
     balances: Balances,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Instance A stalls while holding the payer's lock; Postgres must end it so B can pay.
+    # Instance A stalls right after taking the locks; Postgres must end it so B can pay.
     monkeypatch.setattr(get_settings(), "idle_in_transaction_timeout_ms", 300)
     stalled, resume = threading.Event(), threading.Event()
-    real_fingerprint = service._fingerprint
+    instance_a = create_engine(database_url)  # instance B uses the test's own engine
 
-    def stall_the_first_request(request: BulkPaymentRequest) -> str:
-        if not stalled.is_set():
+    @event.listens_for(instance_a, "after_cursor_execute")
+    def stall_after_locking(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
+        if "FOR NO KEY UPDATE" in statement and not stalled.is_set():
             stalled.set()
             resume.wait(timeout=10)
-        return real_fingerprint(request)
 
-    monkeypatch.setattr(service, "_fingerprint", stall_the_first_request)
     body = request(PINECREST, ("1", LOPEZ))
 
-    def pay(instance: sessionmaker[Session]) -> str:
+    def pay_through(instance: sessionmaker[Session]) -> str:
         with instance() as session:
             try:
                 service.create_bulk_payment(session, body)
@@ -208,15 +204,19 @@ def test_a_stalled_instance_releases_its_locks(
                 return "busy"
             return "created"
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        frozen = pool.submit(pay, instances[0])
-        assert stalled.wait(timeout=10)
-        started = time.monotonic()
-        assert pay(instances[1]) == "created"
-        assert time.monotonic() - started < 3
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            frozen = pool.submit(pay_through, sessionmaker(instance_a))
+            assert stalled.wait(timeout=10)
+            started = time.monotonic()
+            assert pay_through(session_factory) == "created"
+            assert time.monotonic() - started < 3
+            resume.set()
+            # A's session was ended before COMMIT, so it wrote nothing and is safe to retry.
+            assert frozen.result(timeout=10) == "busy"
+    finally:
         resume.set()
-        # A's session was ended before COMMIT, so it wrote nothing and is safe to retry.
-        assert frozen.result(timeout=10) == "busy"
+        instance_a.dispose()
 
     assert balances()[PINECREST] == SEED_BALANCES[PINECREST] - 100
 
@@ -225,7 +225,7 @@ def wait_until_a_session_waits_for_a_lock(engine: Engine) -> None:
     deadline = time.monotonic() + 5
     with engine.connect() as connection:
         while time.monotonic() < deadline:
-            waiting = connection.execute(
+            waiting: int = connection.execute(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE datname = current_database() AND wait_event_type = 'Lock'"
@@ -261,8 +261,10 @@ def test_locks_are_taken_in_id_order(
             {"uuid": early_uuid},
         )
         connection.execute(text("UPDATE firms SET name = name WHERE id = 1"))
-        by_uuid = connection.execute(text("SELECT id FROM firms ORDER BY uuid")).scalars().all()
-        physical = connection.execute(text("SELECT id FROM firms")).scalars().all()
+        by_uuid: list[int] = list(
+            connection.execute(text("SELECT id FROM firms ORDER BY uuid")).scalars()
+        )
+        physical: list[int] = list(connection.execute(text("SELECT id FROM firms")).scalars())
     assert by_uuid == [4, 1, 2, 3]
     assert physical == [2, 3, 4, 1]
     # Pin the plan, so the order a lock query would follow without ORDER BY id is known.
@@ -290,47 +292,43 @@ def test_locks_are_taken_in_id_order(
     assert balances()[PINECREST] == SEED_BALANCES[PINECREST] - 200
 
 
-@pytest.fixture
-def deadlock_once(engine: Engine) -> Iterator[Callable[[], int]]:
-    """The first idempotency-key insert fails as a deadlock. Yields how often the trigger ran."""
-    with engine.begin() as connection:
-        connection.execute(text("CREATE SEQUENCE deadlock_once"))
-        connection.execute(
-            text(
-                "CREATE FUNCTION deadlock_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
-                "IF nextval('deadlock_once') = 1 THEN "
-                "RAISE EXCEPTION 'injected by the test' USING ERRCODE = 'deadlock_detected'; "
-                "END IF; RETURN NEW; END $$"
-            )
-        )
-        connection.execute(
-            text(
-                "CREATE TRIGGER deadlock_once BEFORE INSERT ON idempotency_keys "
-                "FOR EACH ROW EXECUTE FUNCTION deadlock_once()"
-            )
-        )
-
-    def runs() -> int:
-        with engine.connect() as connection:
-            return int(
-                connection.execute(text("SELECT last_value FROM deadlock_once")).scalar_one()
-            )
-
-    yield runs
-    with engine.begin() as connection:
-        connection.execute(text("DROP TRIGGER deadlock_once ON idempotency_keys"))
-        connection.execute(text("DROP FUNCTION deadlock_once()"))
-        connection.execute(text("DROP SEQUENCE deadlock_once"))
+DEADLOCK = "RAISE EXCEPTION 'injected by the test' USING ERRCODE = 'deadlock_detected'"
 
 
-def test_deadlock_at_commit_is_retried(
-    client: TestClient, deadlock_once: Callable[[], int], balances: Balances
+@pytest.mark.parametrize("stage", FAILURE_STAGES)
+def test_a_deadlock_is_retried(
+    client: TestClient, inject_failure: InjectFailure, balances: Balances, stage: str
 ) -> None:
-    # The key row is the transaction's last write, so the retry has to redo all of it.
+    # It strikes after every other write, so the retry has to redo all of it.
+    attempts = inject_failure(DEADLOCK, stage, 1)
+
     response = client.post(
         "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "retry-me"}
     )
 
     assert response.status_code == 201
-    assert deadlock_once() == 2  # one attempt refused, one committed
+    assert attempts() == 2  # one refused, one committed
     assert balances() == AFTER_ONE_SAMPLE
+
+
+@pytest.mark.parametrize("stage", FAILURE_STAGES)
+def test_a_deadlock_that_outlasts_the_retries_is_503_and_writes_nothing(
+    lenient_client: TestClient,
+    inject_failure: InjectFailure,
+    balances: Balances,
+    payments: Payments,
+    stage: str,
+) -> None:
+    # Postgres rolled back every attempt: that is "busy, retry", not an unknown outcome.
+    attempts = inject_failure(DEADLOCK, stage, 3)
+
+    response = lenient_client.post(
+        "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "stuck"}
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.json()["error"]["code"] == "firm_busy"
+    assert attempts() == 3
+    assert balances() == SEED_BALANCES
+    assert payments() == []

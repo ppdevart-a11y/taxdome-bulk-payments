@@ -26,14 +26,20 @@ class IdempotencyKeyReused(ServiceError):
 
 
 class FirmBusy(ServiceError):
-    """A firm's row stayed locked past lock_timeout; safe for the client to retry."""
+    """A firm stayed locked too long, or a deadlock outlasted the retries.
+
+    Postgres rolled the transaction back, so nothing was written; safe to retry.
+    """
 
     status_code = 503
     code = "firm_busy"
 
 
 class ServiceBusy(ServiceError):
-    """No database connection came free in time. Nothing was written; safe to retry."""
+    """No database connection came free in time, or the database failed before COMMIT.
+
+    Nothing was written; safe to retry.
+    """
 
     status_code = 503
     code = "service_busy"

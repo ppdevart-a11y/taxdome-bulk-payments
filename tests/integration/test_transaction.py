@@ -1,44 +1,28 @@
 """One request is one transaction: every write happens, or none does."""
 
-from collections.abc import Callable, Iterator
-from typing import Any
+from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
-from bulk_payments.db import get_session
-from bulk_payments.main import create_app
-from tests.integration.conftest import LOPEZ, NAIR, PINECREST, SAMPLE_REQUEST, SEED_BALANCES
+from tests.integration.conftest import (
+    AFTER_ONE_SAMPLE,
+    LOPEZ,
+    NAIR,
+    PINECREST,
+    SAMPLE_REQUEST,
+    SEED_BALANCES,
+    Balances,
+    InjectFailure,
+    Payments,
+    app_client,
+    pay,
+)
 
-Balances = Callable[[], dict[str, int]]
-Payments = Callable[[], list[tuple[int, int, int, str]]]
 BIGINT_MAX = 2**63 - 1
-
-
-def pay(payer: str, *lines: tuple[str, str]) -> dict[str, Any]:
-    return {
-        "payer_firm_uuid": payer,
-        "payments": [
-            {"amount": amount, "payee_firm_uuid": payee, "description": "transaction test"}
-            for amount, payee in lines
-        ],
-    }
-
-
-@pytest.fixture
-def lenient_client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
-    """Like `client`, but an unexpected error comes back as the 500 a real client would see."""
-
-    def session_override() -> Iterator[Session]:
-        with session_factory() as session:
-            yield session
-
-    app = create_app()
-    app.dependency_overrides[get_session] = session_override
-    with TestClient(app, raise_server_exceptions=False) as client:
-        yield client
+DROP_CONNECTION = "PERFORM pg_terminate_backend(pg_backend_pid())"
 
 
 @pytest.fixture
@@ -98,16 +82,8 @@ def test_payee_credit_overflow_writes_nothing(
 def test_database_down_is_503_and_writes_nothing(balances: Balances, payments: Payments) -> None:
     # Nothing listens on port 1, so the connection fails before anything reaches a database.
     dead = create_engine("postgresql+psycopg://postgres:postgres@127.0.0.1:1/bulk_payments")
-    factory = sessionmaker(dead, expire_on_commit=False)
-
-    def session_override() -> Iterator[Session]:
-        with factory() as session:
-            yield session
-
-    app = create_app()
-    app.dependency_overrides[get_session] = session_override
     try:
-        with TestClient(app) as client:
+        with app_client(sessionmaker(dead, expire_on_commit=False)) as client:
             response = client.post("/bulk_payments", json=SAMPLE_REQUEST)
     finally:
         dead.dispose()
@@ -119,33 +95,15 @@ def test_database_down_is_503_and_writes_nothing(balances: Balances, payments: P
     assert payments() == []
 
 
-@pytest.fixture
-def drop_connection_on_the_last_write(engine: Engine) -> Iterator[None]:
-    """The backend kills itself while storing the idempotency key, the transaction's last write."""
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "CREATE FUNCTION drop_connection() RETURNS trigger LANGUAGE plpgsql AS "
-                "$$ BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); RETURN NEW; END $$"
-            )
-        )
-        connection.execute(
-            text(
-                "CREATE TRIGGER drop_connection BEFORE INSERT ON idempotency_keys "
-                "FOR EACH ROW EXECUTE FUNCTION drop_connection()"
-            )
-        )
-    yield
-    with engine.begin() as connection:
-        connection.execute(text("DROP TRIGGER drop_connection ON idempotency_keys"))
-        connection.execute(text("DROP FUNCTION drop_connection()"))
-
-
-@pytest.mark.usefixtures("drop_connection_on_the_last_write")
 def test_a_connection_lost_before_commit_is_503_and_writes_nothing(
-    lenient_client: TestClient, balances: Balances, payments: Payments
+    lenient_client: TestClient,
+    inject_failure: InjectFailure,
+    balances: Balances,
+    payments: Payments,
 ) -> None:
     # Every write is flushed before COMMIT, so losing the connection there provably wrote nothing.
+    inject_failure(DROP_CONNECTION, "on the last write", 1)
+
     response = lenient_client.post(
         "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "lost"}
     )
@@ -154,6 +112,31 @@ def test_a_connection_lost_before_commit_is_503_and_writes_nothing(
     assert response.json()["error"]["code"] == "service_busy"
     assert balances() == SEED_BALANCES
     assert payments() == []
+
+
+def test_a_connection_lost_during_commit_is_500_and_a_keyed_retry_pays_once(
+    lenient_client: TestClient,
+    inject_failure: InjectFailure,
+    balances: Balances,
+    payments: Payments,
+) -> None:
+    # The service can't tell whether that COMMIT landed, so it must not claim nothing was written.
+    inject_failure(DROP_CONNECTION, "during COMMIT", 1)
+
+    lost = lenient_client.post(
+        "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "lost"}
+    )
+    retry = lenient_client.post(
+        "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "lost"}
+    )
+
+    assert lost.status_code == 500
+    assert lost.json()["error"]["code"] == "internal_error"
+    # Here the COMMIT never landed, so the retry pays; had it landed, the retry would replay.
+    assert retry.status_code == 201
+    assert "Idempotent-Replayed" not in retry.headers
+    assert balances() == AFTER_ONE_SAMPLE
+    assert len(payments()) == 3
 
 
 def test_total_beyond_bigint_is_denied(
