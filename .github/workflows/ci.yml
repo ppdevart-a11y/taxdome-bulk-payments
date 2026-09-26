@@ -52,6 +52,8 @@ jobs:
           test "$code" = 201
       - name: Race demo
         run: uv run python scripts/race_demo.py
+      - name: Load test
+        run: uv run python scripts/load_test.py --seconds 5 --clients 32
       - name: Logs on failure
         if: failure()
         run: docker compose logs
