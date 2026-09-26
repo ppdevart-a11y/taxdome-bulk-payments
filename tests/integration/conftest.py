@@ -32,6 +32,8 @@ PINECREST = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"
 LOPEZ = "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10"
 NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"
 SEED_BALANCES = {PINECREST: 5_000_000, LOPEZ: 50_000, NAIR: 200_000}
+# Worked out by hand: the sample moves $13,251.25 from Pinecrest to Nair and Lopez.
+AFTER_ONE_SAMPLE = {PINECREST: 3_674_875, LOPEZ: 170_075, NAIR: 1_405_050}
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -70,7 +72,7 @@ def engine(database_url: str, alembic_config: Config) -> Iterator[Engine]:
 
 @pytest.fixture(autouse=True)
 def seed(engine: Engine) -> None:
-    """Reset to the spec's three firms before every test."""
+    """Reset to the three sample firms before every test."""
     url = engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
     with psycopg.connect(url, autocommit=True) as connection:
         connection.execute(SEED_SQL)

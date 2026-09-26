@@ -7,12 +7,15 @@ they share. A Barrier releases them together so the transactions overlap.
 
 import random
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from bulk_payments import service
@@ -20,7 +23,14 @@ from bulk_payments.config import get_settings
 from bulk_payments.errors import InsufficientFunds
 from bulk_payments.money import format_cents
 from bulk_payments.schemas import BulkPaymentRequest
-from tests.integration.conftest import LOPEZ, NAIR, PINECREST, SEED_BALANCES
+from tests.integration.conftest import (
+    AFTER_ONE_SAMPLE,
+    LOPEZ,
+    NAIR,
+    PINECREST,
+    SAMPLE_REQUEST,
+    SEED_BALANCES,
+)
 
 FIRMS = [PINECREST, LOPEZ, NAIR]
 Balances = Callable[[], dict[str, int]]
@@ -55,7 +65,7 @@ def run_concurrently(
 
     Anything else (deadlock, constraint violation, timeout) propagates and fails the test.
     """
-    barrier = threading.Barrier(len(requests))
+    barrier = threading.Barrier(len(requests), timeout=30)
 
     def worker(index: int) -> str:
         with instances[index % len(instances)]() as session:
@@ -143,3 +153,138 @@ def test_a_firm_locked_too_long_fails_fast_with_503(
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "1"
     assert response.json()["error"]["code"] == "firm_busy"
+
+
+def test_statement_timeout_is_503(
+    client: TestClient, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A lock wait that outlasts statement_timeout surfaces as 57014, not 55P03.
+    monkeypatch.setattr(get_settings(), "lock_timeout_ms", 10_000)
+    monkeypatch.setattr(get_settings(), "statement_timeout_ms", 200)
+    body = {
+        "payer_firm_uuid": PINECREST,
+        "payments": [{"amount": "1", "payee_firm_uuid": NAIR, "description": "slow"}],
+    }
+
+    with engine.connect() as blocker, blocker.begin():
+        blocker.execute(text("SELECT 1 FROM firms WHERE uuid = :uuid FOR UPDATE"), {"uuid": NAIR})
+        response = client.post("/bulk_payments", json=body)
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.json()["error"]["code"] == "firm_busy"
+
+
+def wait_until_a_session_waits_for_a_lock(engine: Engine) -> None:
+    deadline = time.monotonic() + 5
+    with engine.connect() as connection:
+        while time.monotonic() < deadline:
+            waiting = connection.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                )
+            ).scalar_one()
+            connection.rollback()  # pg_stat_activity is snapshotted once per transaction
+            if waiting:
+                return
+            time.sleep(0.01)
+    raise AssertionError("no session started waiting for a lock")
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        pytest.param("-c enable_seqscan=off -c enable_bitmapscan=off", id="uuid index scan"),
+        pytest.param("-c enable_indexscan=off -c enable_bitmapscan=off", id="table scan"),
+    ],
+)
+def test_locks_are_taken_in_id_order(
+    engine: Engine,
+    database_url: str,
+    balances: Balances,
+    monkeypatch: pytest.MonkeyPatch,
+    plan: str,
+) -> None:
+    monkeypatch.setattr(get_settings(), "lock_timeout_ms", 30_000)
+    # Firm 4 gets the lowest uuid and firm 1 moves to the table's end: neither order is id order.
+    early_uuid = "00000000-0000-4000-8000-000000000001"
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO firms (name, balance_cents, uuid) VALUES ('Early LLC', 0, :uuid)"),
+            {"uuid": early_uuid},
+        )
+        connection.execute(text("UPDATE firms SET name = name WHERE id = 1"))
+        by_uuid = connection.execute(text("SELECT id FROM firms ORDER BY uuid")).scalars().all()
+        physical = connection.execute(text("SELECT id FROM firms")).scalars().all()
+    assert by_uuid == [4, 1, 2, 3]
+    assert physical == [2, 3, 4, 1]
+    # Pin the plan, so the order a lock query would follow without ORDER BY id is known.
+    planned = create_engine(database_url, connect_args={"options": plan})
+
+    def pay_firms_4_and_3() -> None:
+        with Session(planned) as session:
+            body = request(PINECREST, ("1", early_uuid), ("1", NAIR))
+            service.create_bulk_payment(session, body)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with engine.connect() as blocker, blocker.begin():
+                blocker.execute(text("SELECT 1 FROM firms WHERE id = 4 FOR UPDATE"))
+                payment = pool.submit(pay_firms_4_and_3)
+                wait_until_a_session_waits_for_a_lock(engine)
+                # Queued on firm 4, the request must already hold firm 1: only id order does that.
+                with engine.connect() as probe, pytest.raises(OperationalError) as refused:
+                    probe.execute(text("SELECT 1 FROM firms WHERE id = 1 FOR UPDATE NOWAIT"))
+                assert isinstance(refused.value.orig, psycopg.errors.LockNotAvailable)
+            payment.result(timeout=30)
+    finally:
+        planned.dispose()
+
+    assert balances()[PINECREST] == SEED_BALANCES[PINECREST] - 200
+
+
+@pytest.fixture
+def deadlock_once(engine: Engine) -> Iterator[Callable[[], int]]:
+    """The first idempotency-key insert fails as a deadlock. Yields how often the trigger ran."""
+    with engine.begin() as connection:
+        connection.execute(text("CREATE SEQUENCE deadlock_once"))
+        connection.execute(
+            text(
+                "CREATE FUNCTION deadlock_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                "IF nextval('deadlock_once') = 1 THEN "
+                "RAISE EXCEPTION 'injected by the test' USING ERRCODE = 'deadlock_detected'; "
+                "END IF; RETURN NEW; END $$"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TRIGGER deadlock_once BEFORE INSERT ON idempotency_keys "
+                "FOR EACH ROW EXECUTE FUNCTION deadlock_once()"
+            )
+        )
+
+    def runs() -> int:
+        with engine.connect() as connection:
+            return int(
+                connection.execute(text("SELECT last_value FROM deadlock_once")).scalar_one()
+            )
+
+    yield runs
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER deadlock_once ON idempotency_keys"))
+        connection.execute(text("DROP FUNCTION deadlock_once()"))
+        connection.execute(text("DROP SEQUENCE deadlock_once"))
+
+
+def test_deadlock_at_commit_is_retried(
+    client: TestClient, deadlock_once: Callable[[], int], balances: Balances
+) -> None:
+    # The key row is the transaction's last write, so the retry has to redo all of it.
+    response = client.post(
+        "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "retry-me"}
+    )
+
+    assert response.status_code == 201
+    assert deadlock_once() == 2  # one attempt refused, one committed
+    assert balances() == AFTER_ONE_SAMPLE

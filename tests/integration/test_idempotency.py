@@ -8,13 +8,20 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from bulk_payments.errors import IdempotencyKeyReused
 from bulk_payments.schemas import BulkPaymentRequest
 from bulk_payments.service import Outcome, create_bulk_payment
-from tests.integration.conftest import LOPEZ, NAIR, PINECREST, SAMPLE_REQUEST, SEED_BALANCES
+from tests.integration.conftest import (
+    AFTER_ONE_SAMPLE,
+    LOPEZ,
+    NAIR,
+    PINECREST,
+    SAMPLE_REQUEST,
+    SEED_BALANCES,
+)
 
 Balances = Callable[[], dict[str, int]]
 Payments = Callable[[], list[tuple[int, int, int, str]]]
-AFTER_ONE_SAMPLE = {PINECREST: 3_674_875, LOPEZ: 170_075, NAIR: 1_405_050}
 
 
 def post(client: TestClient, body: dict[str, Any], key: str | None = None) -> Any:
@@ -119,7 +126,7 @@ def test_concurrent_duplicates_pay_exactly_once(
 ) -> None:
     # A client that times out and retries aggressively, across both instances.
     request = BulkPaymentRequest.model_validate(SAMPLE_REQUEST)
-    barrier = threading.Barrier(10)
+    barrier = threading.Barrier(10, timeout=30)
 
     def worker(index: int) -> Outcome:
         with instances[index % len(instances)]() as session:
@@ -133,3 +140,58 @@ def test_concurrent_duplicates_pay_exactly_once(
     assert len({outcome.response.model_dump_json() for outcome in outcomes}) == 1
     assert len(payments()) == 3
     assert balances() == AFTER_ONE_SAMPLE
+
+
+def one_payment(payer: str, amount: str, payee: str) -> BulkPaymentRequest:
+    return BulkPaymentRequest.model_validate(
+        {
+            "payer_firm_uuid": payer,
+            "payments": [{"amount": amount, "payee_firm_uuid": payee, "description": "x"}],
+        }
+    )
+
+
+def test_replay_after_the_payer_spent_everything(client: TestClient, balances: Balances) -> None:
+    # The money already moved: the retry must replay before a funds check sees an empty balance.
+    body = one_payment(LOPEZ, "500", NAIR).model_dump(mode="json")
+
+    first = post(client, body, key="all-in")
+    retry = post(client, body, key="all-in")
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.headers["Idempotent-Replayed"] == "true"
+    assert retry.json() == first.json()
+    assert balances() == {**SEED_BALANCES, LOPEZ: 0, NAIR: 250_000}
+
+
+def test_same_key_with_different_bodies_at_once(
+    instances: list[sessionmaker[Session]], balances: Balances, payments: Payments
+) -> None:
+    # One request wins the key. Its twins replay it; the other body is refused, never paid.
+    to_lopez, to_nair = one_payment(PINECREST, "1", LOPEZ), one_payment(PINECREST, "2", NAIR)
+    bodies = [to_lopez] * 5 + [to_nair] * 5
+    barrier = threading.Barrier(len(bodies), timeout=30)
+
+    def worker(index: int) -> str:
+        with instances[index % len(instances)]() as session:
+            barrier.wait()
+            try:
+                outcome = create_bulk_payment(session, bodies[index], idempotency_key="shared")
+            except IdempotencyKeyReused:
+                return "reused"
+            return "replayed" if outcome.replayed else "created"
+
+    with ThreadPoolExecutor(max_workers=len(bodies)) as pool:
+        results = list(pool.map(worker, range(len(bodies))))
+
+    assert results.count("created") == 1
+    winner = bodies[results.index("created")]
+    for body, result in zip(bodies, results, strict=True):
+        assert result in (("created", "replayed") if body is winner else ("reused",))
+    assert len(payments()) == 1
+    paid, payee = (100, LOPEZ) if winner is to_lopez else (200, NAIR)
+    expected = dict(SEED_BALANCES)
+    expected[PINECREST] -= paid
+    expected[payee] += paid
+    assert balances() == expected

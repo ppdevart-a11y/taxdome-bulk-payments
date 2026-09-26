@@ -5,7 +5,11 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from bulk_payments.schemas import MAX_PAYMENTS_PER_REQUEST, BulkPaymentRequest
+from bulk_payments.schemas import (
+    MAX_DESCRIPTION_LENGTH,
+    MAX_PAYMENTS_PER_REQUEST,
+    BulkPaymentRequest,
+)
 
 SAMPLE = json.loads((Path(__file__).parents[2] / "scripts" / "sample_request.json").read_text())
 PAYER = SAMPLE["payer_firm_uuid"]
@@ -18,14 +22,19 @@ def request(**payment_overrides: Any) -> dict[str, Any]:
     return {"payer_firm_uuid": PAYER, "payments": [payment]}
 
 
+def parse(body: dict[str, Any]) -> BulkPaymentRequest:
+    # What production validates: the output of json.loads, in Python mode.
+    return BulkPaymentRequest.model_validate(json.loads(json.dumps(body)))
+
+
 def error_types(body: dict[str, Any]) -> set[str]:
     with pytest.raises(ValidationError) as exc_info:
-        BulkPaymentRequest.model_validate_json(json.dumps(body))
+        parse(body)
     return {error["type"] for error in exc_info.value.errors()}
 
 
-def test_spec_sample_totals_13251_25() -> None:
-    parsed = BulkPaymentRequest.model_validate_json(json.dumps(SAMPLE))
+def test_sample_totals_13251_25() -> None:
+    parsed = parse(SAMPLE)
     assert parsed.total_cents == 1_325_125
     assert [p.amount_cents for p in parsed.payments] == [625_000, 580_050, 120_075]
 
@@ -33,7 +42,7 @@ def test_spec_sample_totals_13251_25() -> None:
 def test_uuids_are_normalised_to_canonical_lowercase() -> None:
     body = request(payee_firm_uuid=PAYEE.upper())
     body["payer_firm_uuid"] = PAYER.upper()
-    parsed = BulkPaymentRequest.model_validate_json(json.dumps(body))
+    parsed = parse(body)
     assert str(parsed.payer_firm_uuid) == PAYER
     assert str(parsed.payments[0].payee_firm_uuid) == PAYEE
 
@@ -63,6 +72,14 @@ def test_payments_are_capped() -> None:
     body = request()
     body["payments"] = body["payments"] * (MAX_PAYMENTS_PER_REQUEST + 1)
     assert error_types(body) == {"too_long"}
+
+
+def test_limits_are_inclusive() -> None:
+    body = request(description="x" * MAX_DESCRIPTION_LENGTH)
+    body["payments"] = body["payments"] * MAX_PAYMENTS_PER_REQUEST
+    parsed = parse(body)
+    assert len(parsed.payments) == MAX_PAYMENTS_PER_REQUEST
+    assert len(parsed.payments[0].description) == MAX_DESCRIPTION_LENGTH
 
 
 def test_firm_cannot_pay_itself() -> None:
