@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException
 
 from bulk_payments.db import get_session
-from bulk_payments.errors import UnsupportedMediaType
+from bulk_payments.errors import InvalidJson, ServiceError, UnsupportedMediaType
 from bulk_payments.schemas import BulkPaymentRequest, BulkPaymentResponse, ErrorResponse
 from bulk_payments.service import create_bulk_payment
 
@@ -60,20 +60,26 @@ IdempotencyKeyHeader = Annotated[
 ]
 
 
-class DuplicateKey(HTTPException):
-    """A JSON object repeats a key. Starlette's type, so FastAPI's body parser lets it through."""
+class BodyRejected(HTTPException):
+    """Carries a ServiceError out of FastAPI's body parse, which lets only HTTPException through."""
 
-    def __init__(self, key: str) -> None:
-        super().__init__(
-            status.HTTP_400_BAD_REQUEST, f"key {key!r} appears more than once in the same object"
-        )
+    def __init__(self, error: ServiceError) -> None:
+        super().__init__(error.status_code, error.message)
+        self.error = error
+
+
+# Enough to recognise the key; the message never echoes a key of any length.
+_MAX_KEY_SHOWN = 40
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     seen: set[str] = set()
     for key, _ in pairs:
         if key in seen:
-            raise DuplicateKey(key)
+            shown = key if len(key) <= _MAX_KEY_SHOWN else f"{key[:_MAX_KEY_SHOWN]}…"
+            raise BodyRejected(
+                InvalidJson(f"key {shown!r} appears more than once in the same object")
+            )
         seen.add(key)
     return dict(pairs)
 
@@ -82,9 +88,7 @@ class _StrictJSONRequest(Request):
     async def json(self) -> Any:
         if not hasattr(self, "_json"):
             if self.headers.get("content-encoding", "identity").lower() != "identity":
-                raise HTTPException(
-                    status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "send the body uncompressed"
-                )
+                raise BodyRejected(UnsupportedMediaType("send the body uncompressed"))
             # FastAPI keeps the last of a repeated key; a body that states two amounts is refused.
             self._json = json.loads(await self.body(), object_pairs_hook=_reject_duplicate_keys)
         return self._json
@@ -132,11 +136,18 @@ _ERRORS: dict[int | str, dict[str, Any]] = {
             "or an Idempotency-Key reused for a different request"
         ),
     },
+    status.HTTP_500_INTERNAL_SERVER_ERROR: {
+        "model": ErrorResponse,
+        "description": (
+            "Outcome unknown, e.g. the connection dropped during COMMIT. Retry with the same "
+            "Idempotency-Key: it replays the payment if it went through"
+        ),
+    },
     status.HTTP_503_SERVICE_UNAVAILABLE: {
         "model": ErrorResponse,
         "description": (
-            "A firm is locked by another payment for too long, or no database connection "
-            "came free. Nothing was written; safe to retry"
+            "A firm is busy with other payments, or the database is unavailable or has no "
+            "free connection. Nothing was written; safe to retry"
         ),
     },
 }

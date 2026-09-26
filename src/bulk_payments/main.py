@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from http import HTTPStatus
+from importlib.metadata import version
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -7,9 +8,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from bulk_payments.api import DuplicateKey, router
+from bulk_payments.api import BodyRejected, router
 from bulk_payments.errors import InvalidJson, ServiceError
 from bulk_payments.schemas import ErrorDetail, ErrorResponse
+
+# Enough to fix a request by. Thousands of entries help no one and cost memory to send.
+_MAX_LISTED_ERRORS = 20
 
 
 def _error(
@@ -23,19 +27,27 @@ def _error(
     return JSONResponse(body.model_dump(exclude_none=True), status_code, headers=headers)
 
 
+def _service_error(exc: ServiceError) -> JSONResponse:
+    retryable = exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    headers = {"Retry-After": "1"} if retryable else None
+    return _error(exc.status_code, exc.code, exc.message, exc.details, headers)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Bulk payments",
         summary="One firm pays many firms from its platform balance, all or nothing.",
-        version="1.0.0",
+        version=version("bulk-payments"),
     )
     app.include_router(router)
 
     @app.exception_handler(ServiceError)
     async def service_error(_: Request, exc: ServiceError) -> JSONResponse:
-        retryable = exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-        headers = {"Retry-After": "1"} if retryable else None
-        return _error(exc.status_code, exc.code, exc.message, exc.details, headers)
+        return _service_error(exc)
+
+    @app.exception_handler(BodyRejected)
+    async def body_rejected(_: Request, exc: BodyRejected) -> JSONResponse:
+        return _service_error(exc.error)
 
     @app.exception_handler(Exception)
     async def unexpected_error(_: Request, exc: Exception) -> JSONResponse:
@@ -47,8 +59,7 @@ def create_app() -> FastAPI:
         if exc.status_code == status.HTTP_400_BAD_REQUEST:
             # FastAPI's catch-all for a body it couldn't decode: invalid UTF-8,
             # nesting too deep, a number too long to convert. Same code as a syntax error.
-            message = exc.detail if isinstance(exc, DuplicateKey) else "body is not valid JSON"
-            return _error(exc.status_code, InvalidJson.code, message)
+            return _error(exc.status_code, InvalidJson.code, "body is not valid JSON")
         # 404, 405 and friends use the same envelope as every other error.
         code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_")
         return _error(exc.status_code, code, str(exc.detail), headers=exc.headers)
@@ -65,14 +76,12 @@ def create_app() -> FastAPI:
                 "type": error["type"],
                 "message": error["msg"],
             }
-            for error in errors
+            for error in errors[:_MAX_LISTED_ERRORS]
         ]
-        return _error(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "validation_error",
-            "request is invalid",
-            details,
-        )
+        message = "request is invalid"
+        if len(errors) > _MAX_LISTED_ERRORS:
+            message += f": {len(errors)} errors, the first {_MAX_LISTED_ERRORS} listed"
+        return _error(status.HTTP_422_UNPROCESSABLE_CONTENT, "validation_error", message, details)
 
     return app
 

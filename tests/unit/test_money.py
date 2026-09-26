@@ -57,6 +57,11 @@ def test_zero_has_a_specific_message() -> None:
         parse_amount("0.00")
 
 
+def test_a_bad_amount_names_the_digit_limits() -> None:
+    with pytest.raises(ValueError, match="at most 15 digits before the decimal point and 2 after"):
+        parse_amount("1000000000000000")
+
+
 @pytest.mark.parametrize(
     ("cents", "formatted"),
     [

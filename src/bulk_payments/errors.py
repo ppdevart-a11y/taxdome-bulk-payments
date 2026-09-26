@@ -46,14 +46,17 @@ class ServiceBusy(ServiceError):
 
 
 class UnsupportedMediaType(ServiceError):
-    """The body wasn't sent as JSON. Kept apart from 422, which means "denied"."""
+    """The body wasn't sent as uncompressed JSON. Kept apart from 422, which means "denied"."""
 
     status_code = 415
     code = "unsupported_media_type"
 
 
 class InvalidJson(ServiceError):
-    """The body isn't one unambiguous JSON document."""
+    """The body isn't one unambiguous JSON document.
+
+    Raised inside FastAPI's body parse, so it travels out wrapped in api.BodyRejected.
+    """
 
     status_code = 400
     code = "invalid_json"

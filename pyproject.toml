@@ -1,6 +1,6 @@
 [project]
 name = "bulk-payments"
-version = "0.1.0"
+version = "1.0.0"
 description = "Bulk payment service: one firm pays many firms from its platform balance"
 readme = "README.md"
 requires-python = ">=3.12"

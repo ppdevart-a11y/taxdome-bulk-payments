@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from bulk_payments.schemas import (
     MAX_DESCRIPTION_LENGTH,
+    MAX_FIELDS_PER_OBJECT,
     MAX_PAYMENTS_PER_REQUEST,
     BulkPaymentRequest,
 )
@@ -35,7 +36,7 @@ def error_types(body: dict[str, Any]) -> set[str]:
 
 def test_sample_totals_13251_25() -> None:
     parsed = parse(SAMPLE)
-    assert parsed.total_cents == 1_325_125
+    assert sum(p.amount_cents for p in parsed.payments) == 1_325_125
     assert [p.amount_cents for p in parsed.payments] == [625_000, 580_050, 120_075]
 
 
@@ -84,6 +85,37 @@ def test_limits_are_inclusive() -> None:
 
 def test_firm_cannot_pay_itself() -> None:
     assert error_types(request(payee_firm_uuid=PAYER)) == {"self_payment"}
+
+
+def test_each_self_payment_is_reported_at_its_line() -> None:
+    body = request()
+    body["payments"] = [
+        {"amount": "1", "payee_firm_uuid": payee, "description": "x"}
+        for payee in (PAYER, PAYEE, PAYER)
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        parse(body)
+    assert [(error["type"], error["loc"]) for error in exc_info.value.errors()] == [
+        ("self_payment", ("payments", 0, "payee_firm_uuid")),
+        ("self_payment", ("payments", 2, "payee_firm_uuid")),
+    ]
+
+
+def test_unknown_fields_are_named_up_to_the_field_limit() -> None:
+    # A payment has 3 fields; a few typos on top are each reported by name.
+    extra = {f"typo{i}": "x" for i in range(MAX_FIELDS_PER_OBJECT - 3)}
+    with pytest.raises(ValidationError) as exc_info:
+        parse(request(**extra))
+    assert [error["loc"][-1] for error in exc_info.value.errors()] == list(extra)
+
+
+@pytest.mark.parametrize("where", ["request", "payment"])
+def test_an_object_over_the_field_limit_is_one_error(where: str) -> None:
+    extra = {f"k{i}": 0 for i in range(100_000)}
+    body = request(**extra) if where == "payment" else {**request(), **extra}
+    with pytest.raises(ValidationError) as exc_info:
+        parse(body)
+    assert [error["type"] for error in exc_info.value.errors()] == ["too_many_fields"]
 
 
 @pytest.mark.parametrize(

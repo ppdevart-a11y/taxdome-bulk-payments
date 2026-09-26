@@ -1,6 +1,6 @@
 import gzip
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -11,21 +11,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from bulk_payments import api
 from bulk_payments.db import get_session
 from bulk_payments.main import create_app
-from bulk_payments.money import format_cents
-from tests.integration.conftest import LOPEZ, NAIR, PINECREST, SAMPLE_REQUEST, SEED_BALANCES
-
-Balances = Callable[[], dict[str, int]]
-Payments = Callable[[], list[tuple[int, int, int, str]]]
-
-
-def pay(payer: str, *lines: tuple[str, str]) -> dict[str, Any]:
-    return {
-        "payer_firm_uuid": payer,
-        "payments": [
-            {"amount": amount, "payee_firm_uuid": payee, "description": f"payment {i}"}
-            for i, (amount, payee) in enumerate(lines)
-        ],
-    }
+from tests.integration.conftest import (
+    LOPEZ,
+    NAIR,
+    PINECREST,
+    SAMPLE_REQUEST,
+    SEED_BALANCES,
+    Balances,
+    Payments,
+    app_client,
+    pay,
+)
 
 
 def test_sample_is_created_and_moves_money_exactly(
@@ -54,8 +50,10 @@ def test_each_returned_id_is_the_row_for_that_line(client: TestClient, engine: E
 
     with engine.connect() as connection:
         rows = connection.execute(text("SELECT id, amount_cents, description FROM payments"))
-        stored = {id_: (format_cents(cents), description) for id_, cents, description in rows}
-    assert {p["id"]: (p["amount"], p["description"]) for p in body["payments"]} == stored
+        stored = {id_: (cents, description) for id_, cents, description in rows}
+    # The sample's lines in cents, worked out by hand.
+    cents = {"6250.00": 625_000, "5800.50": 580_050, "1200.75": 120_075}
+    assert {p["id"]: (cents[p["amount"]], p["description"]) for p in body["payments"]} == stored
     assert [p["description"] for p in body["payments"]] == [
         p["description"] for p in SAMPLE_REQUEST["payments"]
     ]
@@ -144,10 +142,47 @@ def test_validation_errors_point_at_the_field(client: TestClient, payments: Paym
     assert payments() == []
 
 
-def test_self_payment_is_rejected(client: TestClient) -> None:
-    response = client.post("/bulk_payments", json=pay(NAIR, ("1", NAIR)))
+def test_self_payment_is_rejected_at_its_line(client: TestClient, payments: Payments) -> None:
+    response = client.post("/bulk_payments", json=pay(NAIR, ("1", LOPEZ), ("1", NAIR)))
+
     assert response.status_code == 422
-    assert response.json()["error"]["details"][0]["type"] == "self_payment"
+    assert response.json()["error"]["details"] == [
+        {
+            "field": "payments.1.payee_firm_uuid",
+            "type": "self_payment",
+            "message": "a firm cannot pay itself",
+        }
+    ]
+    assert payments() == []
+
+
+def test_a_body_of_unknown_keys_gets_one_error_not_one_per_key(client: TestClient) -> None:
+    # 100,000 unknown keys used to produce 100,000 errors, and a 16 MB body millions.
+    body = json.dumps({f"k{i}": 0 for i in range(100_000)})
+
+    response = post_raw(client, body)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"] == [
+        {
+            "field": "body",
+            "type": "too_many_fields",
+            "message": "has 100000 fields; at most 16 are accepted",
+        }
+    ]
+
+
+def test_a_422_lists_at_most_20_errors(client: TestClient) -> None:
+    body = pay(PINECREST, *[("0", LOPEZ)] * 1000)
+
+    response = client.post("/bulk_payments", json=body)
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["message"] == "request is invalid: 1000 errors, the first 20 listed"
+    assert [detail["field"] for detail in error["details"]] == [
+        f"payments.{i}.amount" for i in range(20)
+    ]
 
 
 def post_raw(client: TestClient, body: bytes | str) -> Any:
@@ -188,6 +223,18 @@ def test_repeated_key_is_refused_not_guessed(client: TestClient, payments: Payme
     assert payments() == []
 
 
+def test_a_repeated_long_key_is_not_echoed_back_whole(client: TestClient) -> None:
+    key = "k" * 1_000_000
+
+    response = post_raw(client, f'{{"{key}": 1, "{key}": 2}}')
+
+    assert response.status_code == 400
+    shown = "k" * 40 + "…"
+    assert response.json()["error"]["message"] == (
+        f"key '{shown}' appears more than once in the same object"
+    )
+
+
 def test_empty_body_is_a_validation_error(client: TestClient) -> None:
     response = post_raw(client, b"")
 
@@ -214,17 +261,9 @@ def test_exhausted_pool_is_503_and_writes_nothing(
     database_url: str, balances: Balances, payments: Payments
 ) -> None:
     engine = create_engine(database_url, pool_size=1, max_overflow=0, pool_timeout=0.2)
-    factory = sessionmaker(engine, expire_on_commit=False)
-
-    def session_override() -> Iterator[Session]:
-        with factory() as session:
-            yield session
-
-    app = create_app()
-    app.dependency_overrides[get_session] = session_override
     try:
         # Holding the pool's only connection leaves none for the request.
-        with engine.connect(), TestClient(app) as client:
+        with engine.connect(), app_client(sessionmaker(engine, expire_on_commit=False)) as client:
             response = client.post("/bulk_payments", json=SAMPLE_REQUEST)
     finally:
         engine.dispose()

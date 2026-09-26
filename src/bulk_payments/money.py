@@ -16,8 +16,8 @@ def parse_amount(value: str) -> int:
     match = _AMOUNT_RE.fullmatch(value)
     if match is None:
         raise ValueError(
-            "must be a positive number of US dollars with at most 2 decimal places, "
-            'e.g. "1200.75" or "300"'
+            "must be a positive number of US dollars, with at most 15 digits before the "
+            'decimal point and 2 after, e.g. "1200.75" or "300"'
         )
     cents = int(match["dollars"]) * 100 + int((match["cents"] or "0").ljust(2, "0"))
     if cents <= 0:
