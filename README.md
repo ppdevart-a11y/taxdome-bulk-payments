@@ -23,9 +23,9 @@ make seed       # the three sample firms
 make sample     # POST scripts/sample_request.json through nginx -> 201
 make balances   # Pinecrest 36,748.75 | Lopez 1,700.75 | Nair 14,050.50
 make demo       # race both replicas concurrently, then check invariants
-make load       # 4 sustained-load scenarios, then prove no money was lost
-make chaos      # kill a replica and restart Postgres under load, then check recovery
-make check      # the gate: lint, types, migrations and all 149 tests (what CI runs)
+make load       # 4 sustained-load scenarios (about 1.5 min), then prove no money was lost
+make chaos      # kill a replica and restart Postgres under load (40 s), then check recovery
+make check      # the gate: lint, types, migrations and all 171 tests (what CI runs)
 make down       # stop and delete the volume
 ```
 
@@ -78,17 +78,17 @@ Idempotency-Key: 7c1d…            (optional, see below)
 | **201** | | Created. The body lists each payment's `id`, the amounts normalised to `"1200.75"`, and `total_amount`. |
 | **422** | `insufficient_funds` | The total exceeds the payer's balance. `details` gives `required` and `available`. |
 | **422** | `unknown_firm` | The payer or a payee doesn't exist. `details.unknown_firm_uuids` lists them. |
-| **422** | `validation_error` | Covers: a bad amount, uuid or description; a self-payment; an unknown field; a missing body; 0 payments or more than 1000. `details` has field paths such as `payments.0.amount`. |
+| **422** | `validation_error` | Covers: a bad amount, uuid or description; a self-payment; an unknown field; a missing body; 0 payments or more than 1000. `details` has field paths such as `payments.0.amount`, at most 20 of them; when there are more, the message gives the total. An object with more than 16 fields gets one `too_many_fields` error, not one per field. |
 | **422** | `idempotency_key_reused` | The same key was sent with a different request. |
-| **400** | `invalid_json` | The body isn't valid JSON (bad syntax, invalid UTF-8, nesting too deep, a number too long), or it repeats a key in an object. `{"amount": "1", "amount": "1000"}` is refused, not guessed at. |
+| **400** | `invalid_json` | The body isn't valid JSON (bad syntax, invalid UTF-8, nesting too deep, a number too long), or it repeats a key in an object (the message quotes the key, cut at 40 characters). `{"amount": "1", "amount": "1000"}` is refused, not guessed at. |
 | **415** | `unsupported_media_type` | The body wasn't sent as `application/json` or another `application/*+json` type, or it was compressed. For example, `curl -d` without the header. |
-| **503** | `firm_busy` | A firm stayed locked past `lock_timeout` (5 s), or a statement ran past `statement_timeout` (10 s). Includes `Retry-After: 1`. Nothing was written, so a retry is safe. |
-| **503** | `service_busy` | Covers two cases: no database connection came free within 5 s, or the database failed before anything was written (restarting, unreachable, or ending a stalled transaction). Includes `Retry-After: 1`. Nothing was written, so a retry is safe. |
-| **500, 502, 504** | | The outcome is unknown: a COMMIT failed midway, or a proxy gave up. The payment may or may not have committed. Retry with the same `Idempotency-Key`, which replays the payment if it went through. |
+| **503** | `firm_busy` | A firm stayed locked past `lock_timeout` (5 s), a statement ran past `statement_timeout` (10 s), or a deadlock or serialization failure outlasted 3 attempts. Includes `Retry-After: 1`. Postgres rolled the transaction back, so a retry is safe. |
+| **503** | `service_busy` | Covers two cases: no database connection came free within 5 s, or the database failed before COMMIT, so nothing was committed (restarting, unreachable, or ending a stalled transaction). Includes `Retry-After: 1`. Nothing was written, so a retry is safe. |
+| **500, 502, 504** | `internal_error` (500) | The outcome is unknown to the client: the connection dropped during COMMIT, another unexpected error occurred, or a proxy gave up. The payment may or may not have committed. Retry with the same `Idempotency-Key`, which replays the payment if it went through. |
 
-A 201 echoes the `Idempotency-Key` it applied. If the echo is missing, the request wasn't deduplicated, for example because the header was misspelled.
+A 201 echoes the `Idempotency-Key` it applied. If the echo is missing, the request wasn't deduplicated, for example because the header was misspelled. A key is 1–255 characters and scoped to the payer; any other length is a 422 on the field `Idempotency-Key`.
 
-Every error from the app has the same shape: `{"error": {"code", "message", "details"}}`. That includes 404, 405 and unexpected 500s, which never expose internals. There are two exceptions:
+Every error from the app has the same shape: `{"error": {"code", "message", "details"}}`, with `details` left out when there are none. That includes 404, 405 and unexpected 500s, which never expose internals. There are two exceptions:
 - `GET /health` (and `HEAD`) answers the load balancer with `{"status": "ok"}`, or 503 `{"status": "database unavailable"}`.
 - nginx's own 413, 502 and 504 pages are HTML.
 
@@ -99,20 +99,24 @@ nginx accepts bodies up to 16 MB. The largest valid request escapes to about 11.
 A request is **one transaction** (`service.py`):
 
 ```sql
+-- Before BEGIN: the request is validated, and hashed if it carries an Idempotency-Key.
 BEGIN;
   -- 0. lock_timeout 5 s, statement_timeout 10 s, idle_in_transaction_session_timeout 5 s.
   -- 1. Lock every firm the request touches, always in id order.
   SELECT id, uuid, balance_cents FROM firms
    WHERE uuid IN (:payer, :payee_1, …) ORDER BY id FOR NO KEY UPDATE;
-  -- 2. Unknown payer -> 422. Idempotency-Key seen before -> replay, done.
-  --    Unknown payee -> 422.
+  -- 2. Unknown payer -> 422. Idempotency-Key seen before: same request -> replay, done;
+  --    another request -> 422. Then: unknown payee -> 422.
   -- 3. total > balance read under the lock -> ROLLBACK, 422.
   -- 4. Debit and all credits as relative deltas, in one statement.
   UPDATE firms SET balance_cents = balance_cents + d.cents
     FROM unnest(:firm_ids, :deltas) AS d(firm_id, cents) WHERE firms.id = d.firm_id;
   -- 5. All payments in one statement; ids come back in request order.
   INSERT INTO payments (…) VALUES …, …, … RETURNING id;
-  -- 6. Every write is flushed before COMMIT: a failure up to here wrote nothing (503).
+  -- 6. With an Idempotency-Key: store it and the response, in the same transaction.
+  INSERT INTO idempotency_keys (…) VALUES (…);
+  -- 7. Every write is flushed before COMMIT: a failure up to here wrote nothing.
+  --    A lost database answers 503; a connection lost during COMMIT answers 500.
 COMMIT;  -- 201
 ```
 
@@ -139,27 +143,27 @@ On MySQL/InnoDB, `ORDER BY` alone isn't enough, because InnoDB locks rows as the
 
 So the pattern uses `[0-9]` with `fullmatch`, and tests cover both traps.
 
-**Timeouts turn contention into fast failures.** Each transaction sets `lock_timeout = 5s`, `statement_timeout = 10s` and `idle_in_transaction_session_timeout = 5s` with `SET LOCAL`, so every lock wait gets 5 s, every statement gets 10 s, and a transaction left idle between statements is ended after 5 s.
+**Timeouts turn contention into fast failures.** Each transaction sets `lock_timeout = 5s`, `statement_timeout = 10s` and `idle_in_transaction_session_timeout = 5s` for the transaction only (`set_config(…, true)`, the form of `SET LOCAL` that takes bind parameters), so every lock wait gets 5 s, every statement gets 10 s, and a transaction left idle between statements is ended after 5 s.
 - A firm held by something slow produces a quick 503 with `Retry-After`, instead of requests and pool connections piling up behind it.
 - An instance that stalls or loses its network while holding locks can't keep firms locked: Postgres ends its transaction and the next request goes through.
 - A request that can't get a database connection within 5 s gets a 503 as well.
-- Deadlocks and serialization failures, which ordered locking should prevent, get a bounded retry of 3 attempts as a safety net.
+- Deadlocks and serialization failures, which ordered locking should prevent, get a bounded retry of 3 attempts as a safety net. One that outlasts them answers 503 `firm_busy`: Postgres rolled back every attempt.
 
-**A failure says whether money moved.** Every write is flushed before COMMIT. So a database failure up to that point (Postgres restarting, a dropped connection, the idle timeout) provably wrote nothing, and answers 503: safe to retry. Only a failure during COMMIT itself, or a client or proxy that gives up first, leaves the outcome unknown (500, 502, 504). That's what the Idempotency-Key is for.
+**A failure says whether money moved.** Every write is flushed before COMMIT, so a failure up to that point provably wrote nothing. When the database caused it (Postgres restarting, a dropped connection, the idle timeout), the answer is 503: safe to retry. A connection lost during COMMIT itself can't be told apart from one lost just after the commit landed, so it answers 500, as does any other unexpected error. Those, and a proxy that gives up first (502, 504), are what the Idempotency-Key is for. Tests pin both sides of the line: a connection dropped on the last write answers 503, one dropped inside COMMIT answers 500, and the keyed retry then pays exactly once.
 
 **Idempotency (optional `Idempotency-Key` header).** A client whose request times out can't tell whether the money moved. With a key, a retry returns the original 201 (`Idempotent-Replayed: true`) instead of paying everyone twice.
 - **No extra locking.** The key is looked up after the payer row is locked, so a concurrent duplicate waits for the original to commit, then replays it.
-- **Replay comes before every check on current state.** A retry still replays after the payer spent everything, or after a payee's uuid changed, because the original request went through.
+- **Replay comes before every check on current state,** except that the payer must exist, since keys are scoped to it. A retry still replays after the payer spent everything, or after a payee's uuid changed, because the original request went through.
 - **Stored with the payments.** The key is written in the same transaction as the payments, so the key exists if and only if the payments do.
-- **Reuse check.** Reusing a key for a different request returns 422. The fingerprint covers every payee, amount and description in order, over normalised values. So `"300"` and `"300.00"`, or a description in composed and decomposed Unicode, count as the same request.
+- **Reuse check.** Reusing a key for a different request returns 422. The fingerprint covers every payee, amount and description in order, over normalised values. So `"300"` and `"300.00"`, or a description in composed and decomposed Unicode, count as the same request. It's computed once, before the transaction and only when a key is sent, so it adds nothing to the time the locks are held.
 - **Echoed back.** A 201 carries the `Idempotency-Key` it applied, so a client can tell when a misspelled header was ignored.
 - **Declines aren't stored.** A retry after a top-up is judged again.
 
-nginx is left at its default of never replaying a failed POST on another replica, and `nginx.conf` explains why.
+nginx is left at its default: a POST that has reached a replica is never replayed on another one, and `nginx.conf` explains why. A POST that couldn't connect at all is passed to the other replica, which is safe because nothing was sent; a chaos run caught one doing that.
 
 ### Schema
 
-The two tables keep the brief's names and columns. The deliberate differences are in `migrations/versions/0001_initial.py`:
+The two tables keep the brief's names and columns. The deliberate differences are in `migrations/versions/`:
 
 - **`BIGINT` for `balance_cents` and `amount_cents`.** A 4-byte `INTEGER` caps a balance at $21,474,836.47, and a large practice can exceed that.
 - **`CHECK (balance_cents >= 0)`, `CHECK (amount_cents > 0)` and `CHECK (payer_firm_id <> payee_firm_id)`.** These are the last line of defence if application code is ever wrong. When the row lock was removed on purpose in testing, the balance CHECK is what stopped the overdraft.
@@ -171,41 +175,52 @@ Migrations run as a one-shot `migrate` service before any replica starts, so rep
 
 ## Testing
 
-There are 149 tests, all behind one gate, `make check`, which CI runs too. Everything that touches the database runs against real PostgreSQL through testcontainers, because locking and constraint behaviour is the thing under test and SQLite can't reproduce it.
+There are 171 tests, all behind one gate, `make check`, which CI runs too. Everything that touches the database runs against real PostgreSQL through testcontainers, because locking and constraint behaviour is the thing under test and SQLite can't reproduce it.
 
 | File | Tests | What it proves |
 |---|---|---|
-| `unit/test_money.py` | 38 | Exact parsing and formatting; Unicode-digit, trailing-newline, exponent and float traps |
-| `unit/test_schemas.py` | 21 | The strict request contract, validated the way production does it (`json.loads`, then Python mode): unknown fields, inclusive limits, self-payment, NUL bytes |
-| `unit/test_commit_hook.py` | 20 | Every command an agent might use to create a commit runs the gate (commit, merge, revert, cherry-pick, rebase, am, pull, in any spelling); other commands don't |
-| `integration/test_api.py` | 32 | The sample's exact balances; all-or-nothing denial at 1 cent over; exact-balance payout; unknown firms; 415 for non-JSON or compressed bodies; 400 `invalid_json` for every unparseable body and for repeated keys, never a 500; 503 when the pool is exhausted; the echoed `Idempotency-Key`; `HEAD /health`; the error envelope for 400/404/405/422/500 |
-| `integration/test_transaction.py` | 6 | A failure after the balances moved rolls everything back; a connection lost before COMMIT, or a database that is down, is a 503 that wrote nothing; a payee credit past BIGINT writes nothing; totals beyond BIGINT are denied by the funds check, before any write; the brief's own example moves money exactly |
-| `integration/test_concurrency.py` | 9 | No overdraft (20 parallel requests against 6 × funds); no deadlock with retries disabled; locks taken in id order under both an index plan and a table-scan plan; a deadlock at commit is retried; conservation and reconciliation under a random storm; lock and statement timeouts each fail fast with 503; a stalled instance's locks are released |
+| `unit/test_money.py` | 39 | Exact parsing and formatting; Unicode-digit, trailing-newline, exponent and float traps; a message that names the digit limits |
+| `unit/test_schemas.py` | 25 | The strict request contract, validated the way production does it (`json.loads`, then Python mode): unknown fields, inclusive limits, self-payments at their line, the 16-field limit, NUL bytes |
+| `unit/test_commit_hook.py` | 30 | The spellings an agent is likely to use for a commit run the gate: commit, merge, revert, cherry-pick, rebase, am and pull, with a path, quotes, a line continuation or `$(which git)`, or chained with `;`, `&&` or `\|`. Other commands don't |
+| `integration/test_api.py` | 35 | The sample's exact balances; all-or-nothing denial at 1 cent over; exact-balance payout; unknown firms; 415 for non-JSON or compressed bodies; 400 `invalid_json` for every unparseable body and for repeated keys, never a 500; one error for a body of 100,000 unknown keys, and at most 20 listed; 503 when the pool is exhausted; the echoed `Idempotency-Key`; `HEAD /health`; the error envelope for 400/404/405/422/500 |
+| `integration/test_transaction.py` | 7 | A failure after the balances moved rolls everything back; a connection lost before COMMIT, or a database that is down, is a 503 that wrote nothing; a connection lost during COMMIT is a 500, and the keyed retry pays once; a payee credit past BIGINT writes nothing; totals beyond BIGINT are denied by the funds check, before any write; the brief's own example moves money exactly |
+| `integration/test_concurrency.py` | 12 | No overdraft (20 parallel requests, and the balance covers 6); no deadlock with retries disabled; locks taken in id order under both an index plan and a table-scan plan; a deadlock before or during COMMIT is retried, and one that outlasts 3 attempts is 503 `firm_busy`; conservation and reconciliation under a random storm; lock and statement timeouts each fail fast with 503; a stalled instance's locks are released |
 | `integration/test_idempotency.py` | 17 | Replay; re-spelled replay, including another Unicode form; replay after the payer spent everything or a payee's uuid changed; key reuse returns 422 when any payee, amount, description, order or line differs; one key sent with two bodies at once pays once; declines aren't remembered; per-payer scope; 10 concurrent duplicates pay once |
 | `integration/test_migrations.py` | 6 | Upgrade → downgrade → upgrade on real Postgres; models match what the migrations create; each CHECK constraint fires |
 
-The concurrency tests use **two separate engines**, standing in for two instances with separate pools, and a `Barrier` so the transactions really overlap. **Each test was checked against the bug it claims to catch** by breaking the code on purpose:
+The concurrency tests use **two separate engines**, standing in for two instances with separate pools, and a `Barrier` so the transactions really overlap. **The tests below were each checked against the bug they claim to catch**, by breaking the code on purpose, in memory, so the files are never edited. Every row was re-run for [spec 0004](docs/specs/0004-fourth-review.md):
 
 | Deliberate bug | Result |
 |---|---|
 | Drop `FOR NO KEY UPDATE` | The overdraft test fails (the CHECK constraint fires). |
-| Lock the payer first, then payees in request order | `DeadlockDetected` |
+| Lock the payer first, then payees in request order | The cross-payment test fails: requests deadlock or time out on each other's locks (503 `firm_busy`). |
 | Drop `ORDER BY id` from the lock query | The lock-order test fails under both plans. |
 | Look up the idempotency key before taking the lock | Duplicate-key violation under concurrent retries |
 | Check funds before looking up the idempotency key | A retry after the payer spent everything gets 422 instead of its replay. |
-| Break the retry loop | A deadlock injected at commit becomes a 500. |
-| Stop mapping `statement_timeout` to 503 | The timeout test gets a 500. |
+| Break the retry loop | The retry tests fail with the raw `DeadlockDetected`, which a client sees as 500 (or get 503 `firm_busy`, if one attempt is allowed). |
+| Stop mapping `statement_timeout` to `firm_busy` | The timeout test gets 503 `service_busy` instead. |
 | Commit the balances before inserting the payments | The rollback test finds the money moved. |
 | Change a model column back to `INTEGER` | The drift test fails. |
 | Drop the idle-in-transaction timeout | A stalled instance keeps the payer locked, and the next request gets 503. |
-| Map a failure before COMMIT to 500, or skip the final flush | The lost-connection and database-down tests get 500 instead of 503. |
+| Map a failure before COMMIT to 500 | The lost-connection test gets 500 instead of 503. The database-down and stalled-instance tests fail with the raw database error, which a client sees as 500. |
+| Skip the final flush | The key is then written during COMMIT, so the lost-connection test gets 500 instead of 503. |
 | Check for unknown payees before looking up the key | A replay after a payee's uuid changed gets 422. |
 | Leave the payee, the description or the Unicode normalisation out of the fingerprint | The matching key-reuse or Unicode test fails. |
 | Drop `lock_timeout` or `statement_timeout` | The timeout test still gets 503, but after 10 s, and fails. |
+| Send an exhausted deadlock down the lost-database branch, as before spec 0004 | The deadlock tests get 503 `service_busy` before COMMIT and 500 during it, instead of 503 `firm_busy`. |
+| Retry deadlocks only at COMMIT | The retry test for a deadlock before COMMIT gets 503. |
+| Answer an exhausted deadlock with `firm_busy` only at COMMIT | The test for a deadlock before COMMIT gets 503 `service_busy`. |
+| Treat a connection lost during COMMIT like one lost before it | The COMMIT test gets 503, a claim that nothing was written, instead of 500. |
+| Drop the 16-field limit | A body of 100,000 unknown keys gets 100,002 errors instead of one. |
+| List every validation error | 1000 bad amounts list 1000 errors instead of 20. |
+| Echo a repeated key whole | The long-key test gets its million characters back. |
+| Drop the handler for errors raised inside the body parse | A repeated key gets the generic "body is not valid JSON" message. |
+| Report a self-payment on the whole body | The self-payment tests lose the line number. |
+| Restore the commit hook's previous pattern | Nine hook tests fail: the chained, piped, quoted, continued and substituted spellings. |
 
 Writing balances as absolute values computed from the locked read passes every test, as it should: while the lock is held, the two are equivalent. Relative updates are defence in depth for the day the lock is lost.
 
-CI (`.github/workflows/ci.yml`) runs `make check`, with its actions pinned by commit SHA. A second job boots the Compose stack, sends the sample through nginx and runs the race demo, which is the concurrency gate under real parallel load. The rules any agent working in this repo follows (three gates, module boundaries, money invariants) are in [CLAUDE.md](CLAUDE.md). A Claude Code hook runs `make check` before any agent commit, and `.github/CODEOWNERS` assigns the money path to a human reviewer.
+CI (`.github/workflows/ci.yml`) runs `make check`, with its actions pinned by commit SHA. A second job boots the Compose stack, sends the sample through nginx, runs the race demo, which is the concurrency gate under real parallel load, and runs a short load test. The rules any agent working in this repo follows (three gates, module boundaries, money invariants) are in [CLAUDE.md](CLAUDE.md). A Claude Code hook runs `make check` when an agent's git command would create a commit. `.github/CODEOWNERS` assigns every file to a human reviewer and lists the money path explicitly. On GitHub, `main` requires both CI jobs, an up-to-date branch and a code owner's review, though admins, the owner included, can bypass that. Actions must be pinned by SHA, and Dependabot alerts are on.
 
 **Browser end to end.** Swagger UI was driven on the running stack with `playwright-cli`, through nginx:
 - Executing the pre-filled sample 4 times gave 201, 201, 201 and then 422 `insufficient_funds`, with $10,246.25 available.
@@ -219,32 +234,33 @@ CI (`.github/workflows/ci.yml`) runs `make check`, with its actions pinned by co
 - A 17 MB body is stopped by nginx with 413.
 - `HEAD /health` answers 200, and a gzip-compressed body gets 415.
 - Nesting depths near the parser's limit get 400 or 422, never 500.
+- A 12 MB body of a million unknown keys gets one 178-byte error in under a second. Measured in-process before the field limit, the same body took 1.85 GB of memory and returned 88 MB of errors. It still peaks at about 0.4 GB, because the JSON is parsed in full before the limit can refuse it.
 - With Postgres stopped, a payment gets 503 `service_busy` with `Retry-After`. Once Postgres is back, the same request gets 201.
 - A client-sent `X-Forwarded-For` doesn't reach the app's logs.
+- Postgres and nginx listen on 127.0.0.1 only.
 
 **Sustained load and chaos** (`make load`, `make chaos`).
-- **Setup:** 64 concurrent clients through nginx, for 20 s per scenario.
+- **Setup:** 64 concurrent clients through nginx, for 20 s per scenario. `make load` takes about a minute and a half.
 - **Checks after every run:**
   - total money is unchanged;
   - no balance is negative;
   - every balance reconciles with the payments table;
-  - the payment rows written match the 201 responses exactly.
+  - in the four scenarios, the payment rows written match the 201 responses exactly. In the chaos run, a request cut off mid-flight may still have committed, so the rows must cover the 201s, and any extra is reported.
 
 | Scenario | Requests/s | p50 | p95 | p99 | Statuses |
 |---|---|---|---|---|---|
-| Spread: 203 firms, random payers, 1–5 payees each | 254 | 153 ms | 832 ms | 1,447 ms | all 201 |
-| Hot payer: every request debits one firm | 367 | 98 ms | 617 ms | 1,263 ms | all 201 |
-| Hot payee: every request credits one firm | 373 | 101 ms | 574 ms | 1,121 ms | all 201 |
-| Retries: half the requests reuse a recent key | 304 | 133 ms | 667 ms | 1,155 ms | all 201 |
+| Spread: 200 firms, random payers, 1–5 payees each | 311 | 118 ms | 727 ms | 1,362 ms | all 201 |
+| Hot payer: every request debits one firm | 418 | 97 ms | 467 ms | 967 ms | all 201 |
+| Hot payee: every request credits one firm | 468 | 89 ms | 405 ms | 849 ms | all 201 |
+| Retries: half the requests reuse a recent key | 329 | 125 ms | 620 ms | 1,129 ms | all 201 |
 
-**The chaos run** applies the same load while it kills one app replica at 10 s, starts it again at 18 s and restarts Postgres at 24 s.
-- **Requests:** 11,857 in total, of which 11,827 got 201.
-  - 29 got 503 while Postgres restarted.
-  - 1 got 502: the request that was inside the killed replica.
+**The chaos run** applies the same load for 40 s. It kills one app replica at 10 s, starts it again at 18 s and restarts Postgres at 24 s. In the latest run:
+- **Requests:** 11,552 in total, of which 11,525 got 201 and 25 got 503 while Postgres restarted.
+- **The killed replica:** 2 requests were inside it when it died, and got 502: the outcome-unknown case. In another run, a request found the replica gone before connecting, so nginx passed it to the other replica, which answered 201.
 - **Recovery:** every request succeeds again once Postgres is back.
-- **Money:** none of the 30 failed requests wrote anything.
+- **Money:** none of the 27 failed requests wrote anything.
 
-**About the numbers:** they were measured on a laptop through Docker Desktop. No container stayed at full CPU, so the latency is mostly queueing, not the service's limit; treat the figures as a floor. CI runs a 5-second load test on every push.
+**About the numbers:** they were measured on a laptop through Docker Desktop, and vary from run to run. No container stayed at full CPU, so the latency is mostly queueing, not the service's limit: treat the throughput as a floor and the latency as a ceiling. CI runs the four scenarios for 5 s each, with 32 clients, on every push to `main` and every pull request.
 
 ## Issues found along the way
 
@@ -285,6 +301,21 @@ CI (`.github/workflows/ci.yml`) runs `make check`, with its actions pinned by co
   - The MySQL advice was wrong.
   - Dependency floors were far below the tested versions.
 
+**Found in the fourth review** ([spec 0004](docs/specs/0004-fourth-review.md)). Three more reviewers, on code quality, on security, and one that checked every claim in the docs against the code, plus a walkthrough from a fresh clone. Nothing lost money, and each finding was reproduced first.
+- **Nothing tested the most important answer.** A connection lost during COMMIT must answer 500, never 503 "nothing was written". Dropping that guard left the suite green. A deferred trigger now kills the connection inside COMMIT.
+- **A deadlock that outlasted the retries got the wrong answer:** 503 `service_busy` ("the database is unavailable"), or 500 at COMMIT, although Postgres had rolled it back. psycopg makes deadlocks `OperationalError`s too, so once the retries ran out, the lost-database branch caught them. They now answer 503 `firm_busy`, like the timeouts.
+- **One body could exhaust a replica.** A 12 MB body of a million unknown keys took 1.85 GB and returned 88 MB of errors. An object over 16 fields now gets one error, and a 422 lists at most 20.
+- **The stack listened on every network interface,** Postgres included, with the password `postgres`. It now binds to 127.0.0.1.
+- **Smaller fixes:**
+  - the request was hashed while the locks were held;
+  - each amount was parsed five times inside the transaction; it's now parsed once, and the debit is summed from the same values that are credited;
+  - a self-payment error didn't name its line;
+  - the commit hook missed chained, quoted and continued spellings, such as `git commit&&git push`;
+  - nginx 1.27 was out of support;
+  - code owners covered only the money path;
+  - mypy skipped the tests and scripts;
+  - about a dozen claims in these docs didn't match the code.
+
 **Pitfalls designed around, each pinned by a test:**
 - **Unicode digits and trailing newlines in amounts.** A natural `^\d+(\.\d{1,2})?$` accepts `"١٢٣"` and `"5\n"`. The pattern uses `[0-9]` with `fullmatch` instead.
 - **The original `INTEGER` money columns overflow at about $21.4M.** They were changed to `BIGINT`.
@@ -295,6 +326,7 @@ CI (`.github/workflows/ci.yml`) runs `make check`, with its actions pinned by co
 ## Assumptions
 
 - **Authentication and authorisation happen upstream, which isn't in scope.** In production, `payer_firm_uuid` must equal the authenticated firm; otherwise anyone could pay out of any firm's balance. It's the first thing to add. Until then, a 422 reveals the payer's balance, and `unknown_firm` reveals whether a uuid exists. With auth, callers only learn about their own firm.
+- **A request locks every firm it names before it can be declined.** So a caller can briefly hold up to 1,001 firms' rows with requests that are then denied. Auth and per-firm rate limits bound this.
 - **A request may pay the same payee several times.** The sample request does exactly that. Credits are summed per payee.
 - **A firm can't pay itself**, and an unknown payer or payee denies the whole request (422), in keeping with "the entire request is denied".
 - **Limits:** 1–1000 payments per request, and descriptions of 1–1000 characters. Unknown JSON fields are rejected, so a typo like `ammount` fails loudly on a money endpoint.
@@ -317,7 +349,7 @@ CI (`.github/workflows/ci.yml`) runs `make check`, with its actions pinned by co
 - **A request deadline:** before starting the transaction, check how long the request has been queued, and refuse work that a proxy has already given up on. Today a request that waited too long can still commit after nginx has answered 504.
 - **Replica restarts:** nginx resolves `app` once, at startup. Restart policies plus `resolve` on the upstream (nginx 1.27.3+) would follow replicas that come back with new addresses.
 - **Descriptions:** control characters and bidirectional overrides are stored as sent. Reject them if descriptions ever reach a UI or a log viewer.
-- **Bounded load per replica:** cap concurrency (uvicorn `--limit-concurrency`) and memory (`mem_limit`), so a flood of large bodies gets 503 instead of exhausting a replica.
+- **Bounded load per replica:** parsing a 12 MB body of a million keys still peaks at about 0.4 GB, so cap concurrency (uvicorn `--limit-concurrency`) and memory (`mem_limit`). A flood of large bodies then gets 503 instead of exhausting a replica.
 - **Production headers:** drop `X-Upstream`. It exposes replica addresses, and exists only for the local demos.
 - **Idempotency key retention:** a TTL cleanup job for `idempotency_keys` (`created_at` is already stored).
 - **Observability:** structured logs, metrics on lock wait time, 422 and 503 rates, and pool saturation, plus tracing.
@@ -333,16 +365,17 @@ src/bulk_payments/
   service.py   the transaction: lock, check, move money, idempotency
   schemas.py   strict request/response contract
   money.py     dollars <-> integer cents
-  models.py    SQLAlchemy models (mirror the migration)
+  models.py    SQLAlchemy models (mirror the migrations)
   errors.py    domain errors -> HTTP status + code
   config.py    settings from env (DATABASE_URL, pool, timeouts)
+  db.py        engine and a session per request
 migrations/    Alembic
 scripts/       seed.sql, sample_request.json, race_demo.py, load_test.py
 tests/         unit/ and integration/ (real Postgres)
-docs/specs/    the approved plan (0001), the pre-submission audit (0002), the failure-mode review (0003), the template
+docs/specs/    the approved plan (0001), the pre-submission audit (0002), the failure-mode review (0003), the fourth review (0004), the template
 .claude/       the hook that runs make check before an agent's commit
 ```
 
 ## How I worked
 
-The commit history is meant to be read in order: one step per commit, and every commit after the scaffold explains *why* in its message. The process (spec review, verification gate, diff review), my tools and my prompts are in [HOW_I_WORKED.md](HOW_I_WORKED.md). The plan behind commits 5–11 is committed verbatim as [spec 0001](docs/specs/0001-bulk-payment-service.md), the pre-submission audit is [spec 0002](docs/specs/0002-pre-submission-audit.md), and the production failure-mode review is [spec 0003](docs/specs/0003-production-failure-modes.md).
+The commit history is meant to be read in order: one step per commit, and every commit after the scaffold explains *why* in its message. The process (spec review, verification gate, diff review), my tools and my prompts are in [HOW_I_WORKED.md](HOW_I_WORKED.md). The plan behind commits 5–11 is committed verbatim as [spec 0001](docs/specs/0001-bulk-payment-service.md), the pre-submission audit is [spec 0002](docs/specs/0002-pre-submission-audit.md), the production failure-mode review is [spec 0003](docs/specs/0003-production-failure-modes.md), and the fourth review is [spec 0004](docs/specs/0004-fourth-review.md).
