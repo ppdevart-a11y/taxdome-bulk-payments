@@ -1,4 +1,4 @@
--- Resets the database to the three firms from the challenge's sample.
+-- Resets the database to the three sample firms.
 -- Safe to run repeatedly: wipes payments and idempotency keys first.
 BEGIN;
 
