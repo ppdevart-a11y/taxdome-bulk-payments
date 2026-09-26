@@ -2,4 +2,8 @@
 /src/bulk_payments/service.py  @ppdevart-a11y
 /src/bulk_payments/money.py    @ppdevart-a11y
 /src/bulk_payments/schemas.py  @ppdevart-a11y
+/src/bulk_payments/api.py      @ppdevart-a11y
+/src/bulk_payments/config.py   @ppdevart-a11y
+/src/bulk_payments/models.py   @ppdevart-a11y
+/nginx.conf                    @ppdevart-a11y
 /migrations/                   @ppdevart-a11y

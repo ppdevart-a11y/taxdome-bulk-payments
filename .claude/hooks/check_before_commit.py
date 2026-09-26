@@ -1,4 +1,4 @@
-"""Claude Code PreToolUse hook: block an agent's git commit until make check passes."""
+"""Claude Code PreToolUse hook: block anything that creates a commit until make check passes."""
 
 import json
 import os
@@ -6,17 +6,21 @@ import re
 import subprocess
 import sys
 
-# Any `git … commit` on a line. A false positive costs one extra make check; a miss skips the gate.
-GIT_COMMIT = re.compile(r"(?:^|[\s;&|(/\"'`])git(?:\s.*)?\scommit(?:\s|$)", re.MULTILINE)
+# Any git command that creates commits, on any line. A false positive costs one extra make check;
+# a miss skips the gate.
+CREATES_COMMITS = re.compile(
+    r"(?:^|[\s;&|(/\"'`])git(?:\s.*)?\s(?:commit|merge|revert|cherry-pick|rebase|am|pull)(?:\s|$)",
+    re.MULTILINE,
+)
 
 
-def is_commit(command: str) -> bool:
-    return GIT_COMMIT.search(command) is not None
+def creates_commits(command: str) -> bool:
+    return CREATES_COMMITS.search(command) is not None
 
 
 def main() -> None:
     command = json.load(sys.stdin)["tool_input"]["command"]
-    if not is_commit(command):
+    if not creates_commits(command):
         return
     gate = subprocess.run(
         ["make", "check"],  # noqa: S607

@@ -1,4 +1,4 @@
-"""Every way an agent spells `git commit` must run the gate first."""
+"""Every command an agent might use to create a commit must run the gate first."""
 
 import importlib.util
 from pathlib import Path
@@ -31,15 +31,29 @@ hook = load_hook()
         "git add a.py && git commit -m x",
         "git --no-pager commit --amend",
         "git commit -q -F - -- a.py <<'EOF'\nSubject\nEOF",
+        "git merge feature",
+        "git revert HEAD",
+        "git cherry-pick abc123",
+        "git rebase main",
+        "git am fix.patch",
+        "git pull origin main",
     ],
 )
-def test_commits_run_the_gate(command: str) -> None:
-    assert hook.is_commit(command)
+def test_commands_that_create_commits_run_the_gate(command: str) -> None:
+    assert hook.creates_commits(command)
 
 
 @pytest.mark.parametrize(
     "command",
-    ["git status", "git commit-tree abc123", "echo committed", "legit commit", "uv run pytest"],
+    [
+        "git status",
+        "git commit-tree abc123",
+        "git merge-base main HEAD",
+        "git log --oneline",
+        "echo committed",
+        "legit commit",
+        "uv run pytest",
+    ],
 )
 def test_other_commands_do_not(command: str) -> None:
-    assert not hook.is_commit(command)
+    assert not hook.creates_commits(command)
