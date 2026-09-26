@@ -1,5 +1,5 @@
 COMPOSE := docker compose
-PSQL := $(COMPOSE) exec -T postgres psql -U postgres -d bulk_payments -v ON_ERROR_STOP=1
+PSQL := $(COMPOSE) exec -T postgres psql -q -U postgres -d bulk_payments -v ON_ERROR_STOP=1
 
 .PHONY: help install up down seed balances sample check test lint format demo load chaos
 
@@ -42,8 +42,8 @@ format: ## Auto-format and fix lint
 demo: ## Concurrent requests through nginx to both replicas, then check invariants
 	uv run python scripts/race_demo.py
 
-load: ## Sustained load through nginx (4 scenarios), then prove no money was lost
+load: ## Sustained load through nginx (4 scenarios, about 1.5 min), then prove no money was lost
 	uv run python scripts/load_test.py
 
-chaos: ## Kill a replica and restart Postgres under load, then check recovery and money
+chaos: ## Kill a replica and restart Postgres under load (40 s), then check recovery and money
 	uv run python scripts/load_test.py --chaos
