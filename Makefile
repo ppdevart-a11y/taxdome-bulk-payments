@@ -1,7 +1,7 @@
 COMPOSE := docker compose
 PSQL := $(COMPOSE) exec -T postgres psql -U postgres -d bulk_payments -v ON_ERROR_STOP=1
 
-.PHONY: help install up down seed balances sample test lint format demo
+.PHONY: help install up down seed balances sample check test lint format demo
 
 help: ## List targets
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -24,6 +24,8 @@ balances: ## Show firm balances in dollars
 sample: ## POST the sample request through the load balancer
 	curl -sS -i -X POST localhost:8080/bulk_payments \
 		-H 'Content-Type: application/json' -d @scripts/sample_request.json; echo
+
+check: lint test ## The gate: lint, types, migrations and every test must pass before a commit
 
 test: ## Unit + integration tests (starts a throwaway Postgres via testcontainers)
 	uv run pytest
