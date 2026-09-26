@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from bulk_payments import service
 from bulk_payments.config import get_settings
-from bulk_payments.errors import InsufficientFunds
+from bulk_payments.errors import InsufficientFunds, ServiceBusy
 from bulk_payments.money import format_cents
 from bulk_payments.schemas import BulkPaymentRequest
 from tests.integration.conftest import (
@@ -148,11 +148,14 @@ def test_a_firm_locked_too_long_fails_fast_with_503(
 
     with engine.connect() as blocker, blocker.begin():
         blocker.execute(text("SELECT 1 FROM firms WHERE uuid = :uuid FOR UPDATE"), {"uuid": NAIR})
+        started = time.monotonic()
         response = client.post("/bulk_payments", json=body)
+        elapsed = time.monotonic() - started
 
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "1"
     assert response.json()["error"]["code"] == "firm_busy"
+    assert elapsed < 2  # the 200 ms lock_timeout fired, not the 10 s statement_timeout
 
 
 def test_statement_timeout_is_503(
@@ -168,11 +171,54 @@ def test_statement_timeout_is_503(
 
     with engine.connect() as blocker, blocker.begin():
         blocker.execute(text("SELECT 1 FROM firms WHERE uuid = :uuid FOR UPDATE"), {"uuid": NAIR})
+        started = time.monotonic()
         response = client.post("/bulk_payments", json=body)
+        elapsed = time.monotonic() - started
 
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "1"
     assert response.json()["error"]["code"] == "firm_busy"
+    assert elapsed < 2  # the 200 ms statement_timeout fired, not the 10 s lock_timeout
+
+
+def test_a_stalled_instance_releases_its_locks(
+    instances: list[sessionmaker[Session]],
+    balances: Balances,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Instance A stalls while holding the payer's lock; Postgres must end it so B can pay.
+    monkeypatch.setattr(get_settings(), "idle_in_transaction_timeout_ms", 300)
+    stalled, resume = threading.Event(), threading.Event()
+    real_fingerprint = service._fingerprint
+
+    def stall_the_first_request(request: BulkPaymentRequest) -> str:
+        if not stalled.is_set():
+            stalled.set()
+            resume.wait(timeout=10)
+        return real_fingerprint(request)
+
+    monkeypatch.setattr(service, "_fingerprint", stall_the_first_request)
+    body = request(PINECREST, ("1", LOPEZ))
+
+    def pay(instance: sessionmaker[Session]) -> str:
+        with instance() as session:
+            try:
+                service.create_bulk_payment(session, body)
+            except ServiceBusy:
+                return "busy"
+            return "created"
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        frozen = pool.submit(pay, instances[0])
+        assert stalled.wait(timeout=10)
+        started = time.monotonic()
+        assert pay(instances[1]) == "created"
+        assert time.monotonic() - started < 3
+        resume.set()
+        # A's session was ended before COMMIT, so it wrote nothing and is safe to retry.
+        assert frozen.result(timeout=10) == "busy"
+
+    assert balances()[PINECREST] == SEED_BALANCES[PINECREST] - 100
 
 
 def wait_until_a_session_waits_for_a_lock(engine: Engine) -> None:

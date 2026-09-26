@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     # beats piling up requests (and pool connections) behind it.
     lock_timeout_ms: int = 5_000
     statement_timeout_ms: int = 10_000
+    # Ends a transaction left idle between statements, e.g. by a stalled instance holding locks.
+    idle_in_transaction_timeout_ms: int = 5_000
 
 
 @lru_cache

@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from bulk_payments.db import get_session
@@ -92,6 +92,67 @@ def test_payee_credit_overflow_writes_nothing(
 
     assert response.status_code == 500
     assert balances() == before
+    assert payments() == []
+
+
+def test_database_down_is_503_and_writes_nothing(balances: Balances, payments: Payments) -> None:
+    # Nothing listens on port 1, so the connection fails before anything reaches a database.
+    dead = create_engine("postgresql+psycopg://postgres:postgres@127.0.0.1:1/bulk_payments")
+    factory = sessionmaker(dead, expire_on_commit=False)
+
+    def session_override() -> Iterator[Session]:
+        with factory() as session:
+            yield session
+
+    app = create_app()
+    app.dependency_overrides[get_session] = session_override
+    try:
+        with TestClient(app) as client:
+            response = client.post("/bulk_payments", json=SAMPLE_REQUEST)
+    finally:
+        dead.dispose()
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.json()["error"]["code"] == "service_busy"
+    assert balances() == SEED_BALANCES
+    assert payments() == []
+
+
+@pytest.fixture
+def drop_connection_on_the_last_write(engine: Engine) -> Iterator[None]:
+    """The backend kills itself while storing the idempotency key, the transaction's last write."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE FUNCTION drop_connection() RETURNS trigger LANGUAGE plpgsql AS "
+                "$$ BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); RETURN NEW; END $$"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TRIGGER drop_connection BEFORE INSERT ON idempotency_keys "
+                "FOR EACH ROW EXECUTE FUNCTION drop_connection()"
+            )
+        )
+    yield
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER drop_connection ON idempotency_keys"))
+        connection.execute(text("DROP FUNCTION drop_connection()"))
+
+
+@pytest.mark.usefixtures("drop_connection_on_the_last_write")
+def test_a_connection_lost_before_commit_is_503_and_writes_nothing(
+    lenient_client: TestClient, balances: Balances, payments: Payments
+) -> None:
+    # Every write is flushed before COMMIT, so losing the connection there provably wrote nothing.
+    response = lenient_client.post(
+        "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "lost"}
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_busy"
+    assert balances() == SEED_BALANCES
     assert payments() == []
 
 

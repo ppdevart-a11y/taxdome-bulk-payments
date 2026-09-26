@@ -7,6 +7,7 @@ touches, checks funds while holding those locks, then writes and commits.
 
 import hashlib
 import json
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -34,6 +35,8 @@ _MAX_ATTEMPTS = 3
 _RETRYABLE = (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure)
 # lock_timeout / statement_timeout fired: a firm is locked by long-running work.
 _BUSY = (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled)
+# The connection or the transaction ended under us: Postgres restarting, the idle timeout.
+_LOST = (psycopg.OperationalError, psycopg.errors.IdleInTransactionSessionTimeout)
 
 # Debit and credits in one round trip. Relative updates, so the statement is
 # correct regardless of what the balance was read as.
@@ -56,9 +59,12 @@ def create_bulk_payment(
 ) -> Outcome:
     attempt = 1
     while True:
+        committing = False
         try:
             with session.begin():
-                return _transfer(session, request, idempotency_key)
+                outcome = _transfer(session, request, idempotency_key)
+                committing = True
+            return outcome
         except PoolTimeoutError as exc:
             # No connection came free, so nothing reached the database.
             raise ServiceBusy("the service is busy, retry shortly") from exc
@@ -70,6 +76,9 @@ def create_bulk_payment(
             if isinstance(exc.orig, _RETRYABLE) and attempt < _MAX_ATTEMPTS:
                 attempt += 1
                 continue
+            if isinstance(exc.orig, _LOST) and not committing:
+                # Failed before COMMIT, with every write already flushed: all of it rolled back.
+                raise ServiceBusy("the database is unavailable, retry shortly") from exc
             raise
 
 
@@ -78,9 +87,14 @@ def _transfer(
 ) -> Outcome:
     settings = get_settings()
     # SET LOCAL cannot take bind parameters; set_config(..., is_local => true) is equivalent.
-    session.execute(select(func.set_config("lock_timeout", f"{settings.lock_timeout_ms}ms", True)))
+    # The idle timeout ends a transaction whose instance stalls while holding the locks.
+    timeouts = {
+        "lock_timeout": settings.lock_timeout_ms,
+        "statement_timeout": settings.statement_timeout_ms,
+        "idle_in_transaction_session_timeout": settings.idle_in_transaction_timeout_ms,
+    }
     session.execute(
-        select(func.set_config("statement_timeout", f"{settings.statement_timeout_ms}ms", True))
+        select(*(func.set_config(name, f"{ms}ms", True) for name, ms in timeouts.items()))
     )
 
     payer_uuid = str(request.payer_firm_uuid)
@@ -97,17 +111,18 @@ def _transfer(
         .with_for_update(key_share=True)
     ).all()
     by_uuid = {firm.uuid: firm for firm in firms}
+    unknown = sorted(uuids - by_uuid.keys())
 
-    if unknown := sorted(uuids - by_uuid.keys()):
+    payer = by_uuid.get(payer_uuid)
+    if payer is None:
         raise UnknownFirms("unknown firm uuid", {"unknown_firm_uuids": unknown})
-
-    payer = by_uuid[payer_uuid]
 
     fingerprint = _fingerprint(request)
     if idempotency_key is not None:
         # Race-free without extra locking: we hold the payer's row lock, and every
         # request from this payer takes it first. A concurrent duplicate therefore
         # waits for the original to commit, then finds its key here and replays.
+        # It runs before the checks on current state, so a retry of a paid request replays.
         stored = session.execute(
             select(IdempotencyKey.request_fingerprint, IdempotencyKey.response_body).where(
                 IdempotencyKey.payer_firm_id == payer.id, IdempotencyKey.key == idempotency_key
@@ -119,6 +134,9 @@ def _transfer(
                     "this Idempotency-Key was already used for a different request"
                 )
             return Outcome(BulkPaymentResponse.model_validate(stored.response_body), replayed=True)
+
+    if unknown:
+        raise UnknownFirms("unknown firm uuid", {"unknown_firm_uuids": unknown})
 
     total = request.total_cents
     # The balance was read under the lock: nobody can spend it before we commit.
@@ -172,19 +190,26 @@ def _transfer(
                 response_body=response.model_dump(mode="json"),
             )
         )
+    # Send every write now: a failure before COMMIT then provably wrote nothing.
+    session.flush()
     return Outcome(response)
 
 
 def _fingerprint(request: BulkPaymentRequest) -> str:
     """Hash of what the request means, not how it was spelled.
 
-    "300" and "300.00", or upper- and lower-case uuids, are the same payment
-    and must not trip the reused-key check on a legitimate retry.
+    "300" and "300.00", upper- and lower-case uuids, or a description in composed
+    and decomposed Unicode are the same payment and must not trip the reused-key
+    check on a legitimate retry.
     """
     canonical = {
         "payer": str(request.payer_firm_uuid),
         "payments": [
-            [str(payment.payee_firm_uuid), payment.amount_cents, payment.description]
+            [
+                str(payment.payee_firm_uuid),
+                payment.amount_cents,
+                unicodedata.normalize("NFC", payment.description),
+            ]
             for payment in request.payments
         ],
     }

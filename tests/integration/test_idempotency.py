@@ -4,6 +4,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
@@ -195,3 +196,86 @@ def test_same_key_with_different_bodies_at_once(
     expected[PINECREST] -= paid
     expected[payee] += paid
     assert balances() == expected
+
+
+def two_lines() -> dict[str, Any]:
+    return {
+        "payer_firm_uuid": PINECREST,
+        "payments": [
+            {"amount": "1", "payee_firm_uuid": LOPEZ, "description": "first"},
+            {"amount": "2", "payee_firm_uuid": NAIR, "description": "second"},
+        ],
+    }
+
+
+def change_payee(body: dict[str, Any]) -> None:
+    body["payments"][0]["payee_firm_uuid"] = NAIR
+
+
+def change_amount(body: dict[str, Any]) -> None:
+    body["payments"][0]["amount"] = "1.01"
+
+
+def change_description(body: dict[str, Any]) -> None:
+    body["payments"][0]["description"] = "other"
+
+
+def reorder_lines(body: dict[str, Any]) -> None:
+    body["payments"].reverse()
+
+
+def add_a_line(body: dict[str, Any]) -> None:
+    body["payments"].append(dict(body["payments"][0]))
+
+
+@pytest.mark.parametrize(
+    "change", [change_payee, change_amount, change_description, reorder_lines, add_a_line]
+)
+def test_a_key_reused_for_any_other_request_is_rejected(
+    client: TestClient, payments: Payments, change: Callable[[dict[str, Any]], None]
+) -> None:
+    # Every field that decides who gets paid what must be in the fingerprint.
+    assert post(client, two_lines(), key="order-7").status_code == 201
+    different = two_lines()
+    change(different)
+
+    response = post(client, different, key="order-7")
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "idempotency_key_reused"
+    assert len(payments()) == 2
+
+
+def test_the_same_description_in_another_unicode_form_is_a_replay(
+    client: TestClient, payments: Payments
+) -> None:
+    composed = one_payment(PINECREST, "1", LOPEZ).model_dump(mode="json")
+    composed["payments"][0]["description"] = "Café"
+    decomposed = copy.deepcopy(composed)
+    decomposed["payments"][0]["description"] = "Café"
+
+    first = post(client, composed, key="cafe")
+    retry = post(client, decomposed, key="cafe")
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.headers["Idempotent-Replayed"] == "true"
+    assert len(payments()) == 1
+
+
+def test_replay_after_a_payee_changed_its_uuid(client: TestClient, engine: Engine) -> None:
+    # The key is looked up before any check on current state: the original request went through.
+    body = one_payment(PINECREST, "1", LOPEZ).model_dump(mode="json")
+    first = post(client, body, key="moved")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE firms SET uuid = :new WHERE uuid = :old"),
+            {"new": "11111111-1111-4111-8111-111111111111", "old": LOPEZ},
+        )
+
+    retry = post(client, body, key="moved")
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.headers["Idempotent-Replayed"] == "true"
+    assert retry.json() == first.json()
