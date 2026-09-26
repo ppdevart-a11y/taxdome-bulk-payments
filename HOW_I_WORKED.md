@@ -1,18 +1,24 @@
 # How I worked
 
+## Process
+
+I work through three gates. Each catches a different kind of mistake, and the money path gets the most scrutiny, because errors there don't raise exceptions: they pay out the wrong amount.
+
+| Gate | What happened in this project |
+|---|---|
+| **1. Spec review** | Before commit 5, Claude read the repo in plan mode and asked clarifying questions about reset scope, schema, stack and tools. It then wrote a plan covering the steps, the files, the contracts affected, and how each step would be verified. I approved it before any of that code was written. The plan is committed verbatim as [spec 0001](docs/specs/0001-bulk-payment-service.md), and commits 5–11 carry the subjects it names. |
+| **2. Verification harness** | Lint and strict types were set up in commit 1, before any business code. From commit 5, when the first database tests landed, lint, types and the full suite against real PostgreSQL ran before every commit. That is now one command, `make check`: CI runs it, and a Claude Code hook runs it before any agent commit and blocks the commit if it fails. The tests were proven by breaking the code on purpose, and each break was caught:<br>• removing the row lock (the overdraft was stopped by the balance CHECK);<br>• locking payees in request order (deadlock);<br>• looking up the idempotency key before taking the lock (duplicate-key error under concurrent retries);<br>• changing a model back to `INTEGER` (drift caught).<br>The concurrency tests and the CI race job act as the load gate, because a test database with no parallel load hides locking bugs. |
+| **3. Review** | Claude re-read its own output before each commit. That caught a CI job that would have queried an unseeded database, and a README claim that didn't match what had actually happened. A final audit then probed the live stack the way a reviewer would, including driving Swagger UI in a real browser with `playwright-cli`. It found three gaps, which were fixed:<br>• a confusing 422 for `curl -d` sent without a Content-Type;<br>• nginx's body limit sitting below the API's own limits;<br>• Swagger UI pre-filled with firms that don't exist.<br>From that audit onward, nothing was committed without my explicit approval. I also reviewed `money.py` and `service.py` myself, and `.github/CODEOWNERS` now assigns those files and the migrations to me for review. |
+
+The harness dates from commit 1, and the spec was approved before commit 5. Writing the rules down came last, from what this build proved: each money rule in [CLAUDE.md](CLAUDE.md) names the test that holds it. Where each gate shows in the history:
+
+- **Spec:** [spec 0001](docs/specs/0001-bulk-payment-service.md), the plan behind commits 5–11 (added in commit 14).
+- **Harness:** commit 1 (ruff, strict mypy, pytest, no business code) → 5 (real PostgreSQL) → 6 (concurrency, proven by breaking the code) → 9 (CI and the race job) → 13 and 15 (migration checks, one `make check`, the commit hook).
+- **Review:** commit 12 (the audit's fixes) → 15 (code owners on the money path, a PR checklist).
+
 ## Tools
 
-I used one AI tool: **Claude Code** in the VS Code extension, running Claude Opus 5.5.
-
-| Stage | How Claude Code fit in |
-|---|---|
-| Planning | Plan mode. It read the repo and history, asked clarifying questions (reset scope, schema, stack, tools), and wrote a step-by-step plan that I approved before any code changed. |
-| Implementation | It wrote the service, API, migration, tests, Docker/Compose, CI and docs, one step per commit. |
-| Verification | It ran lint, mypy and the full test suite against real PostgreSQL after every step. It brought up the two-replica stack, sent the sample through nginx and ran the race demo. It also drove Swagger UI in a real browser with `playwright-cli`: 201 three times, then 422, an idempotent replay, and the brief's exact balances in the database. |
-| Proving the tests | It broke the code on purpose (removed the row lock, reordered the locks, moved the idempotency lookup) to confirm each test fails for the right reason, then restored it. |
-| Review | It re-read its own output before each commit. This caught a CI job that would have queried an unseeded database, and a README claim that didn't match what had actually happened. A final audit against the brief, probing the live stack the way a reviewer would, found three more gaps, which it fixed: a confusing 422 for `curl -d` without a Content-Type, nginx's body limit sitting below the API's own limits, and Swagger UI pre-filled with firms that don't exist. |
-
-My part was scope and direction: which brief to follow, keeping the existing work, the stack, the deliverables, and the bar for commit quality. I also approved the plan. The engineering decisions and their reasoning are Claude's, and they're recorded in the commit messages and the README.
+I used one AI tool: **Claude Code** in the VS Code extension, running Claude Opus 5.5. It wrote the code, tests, infrastructure and docs, including the money path. In my own work I write money math by hand; here I let the agent write it and made the checks independent of the author instead: expected balances taken from the brief, tests proven by breaking the code on purpose, and my own review of that code. My part was scope and direction: which brief to follow, the stack, the deliverables and the bar for commit quality, plus the approvals at the gates. The engineering decisions and their reasoning are Claude's, and they're recorded in the commit messages and the README.
 
 ## Commit history
 
@@ -32,6 +38,10 @@ Read it top to bottom. Each commit is one step, and its message explains why.
 | 10 | Write README as a pull request description | Design, alternatives, issues, assumptions, next steps. |
 | 11 | Document tools, commit history and the prompts for each step | This file. |
 | 12 | Return 415 for non-JSON bodies and verify the stack in a browser | A final audit against the brief, and a browser run through nginx. |
+| 13 | Check migrations round trip and model drift on real Postgres | A migration that can't roll back, or a model that drifts from it, fails the gate. |
+| 14 | Add the approved plan as spec 0001 and a spec template | The plan behind commits 5–11, verbatim, and a template for the next change. |
+| 15 | Codify the three gates and enforce them for agents and reviewers | CLAUDE.md with each money rule tied to its test; `make check` in CI and before any agent commit; code owners on the money path. |
+| 16 | Trace each gate through the history and record the money-path review | Where each gate shows in the history, and my review of the money path. |
 
 ## Prompts
 
@@ -74,3 +84,13 @@ Prompts tidied for readability.
 
 **8. Final audit**
 > Before we call it done, recheck everything against the brief. Then verify the running stack end to end in a real browser with playwright-cli; passing tests alone aren't enough.
+
+**9. Align with how I work**
+> Bring the repo in line with how I work: spec first, one verification gate, written rules for agents, and human review on the money path.
+
+*Claude:* wrote a spec first and built it after I approved: CLAUDE.md with the three gates, module boundaries and money invariants; one `make check` that CI also runs; and migration checks on real PostgreSQL.
+
+**10. Challenge**
+> Don't settle for the first acceptable answer. What's the strongest version of this, and what's missing to get there?
+
+*Claude:* looked for evidence already in the repo before adding anything. The approved plan predates commit 5 and names commits 5–11, and commit 1 is the harness, so it committed the plan verbatim as spec 0001 and tied each money rule in CLAUDE.md to the test that holds it. It then added code owners on the money path, a PR checklist and a hook that blocks an agent's commit until `make check` passes. Nothing in the money path changed.

@@ -21,8 +21,7 @@ make seed       # the three firms from the brief
 make sample     # POST scripts/sample_request.json through nginx -> 201
 make balances   # Pinecrest 36,748.75 | Lopez 1,700.75 | Nair 14,050.50
 make demo       # race both replicas concurrently, then check invariants
-make test       # 89 tests; integration tests start their own Postgres
-make lint       # ruff + mypy --strict
+make check      # the gate: lint, types, migrations and all 91 tests (what CI runs)
 make down       # stop and delete the volume
 ```
 
@@ -125,7 +124,7 @@ Migrations run as a one-shot `migrate` service before any replica starts, so rep
 
 ## Testing
 
-89 tests. Everything that touches the database runs against real PostgreSQL through testcontainers, because locking and constraint behaviour is the thing under test and SQLite can't reproduce it.
+91 tests, all behind one gate, `make check`, which CI runs too. Everything that touches the database runs against real PostgreSQL through testcontainers, because locking and constraint behaviour is the thing under test and SQLite can't reproduce it.
 
 | File | Tests | What it proves |
 |---|---|---|
@@ -134,6 +133,7 @@ Migrations run as a one-shot `migrate` service before any replica starts, so rep
 | `integration/test_api.py` | 19 | The brief's exact balances; all-or-nothing denial at 1 cent over; exact-balance payout; unknown firms; 415 for non-JSON; error envelope for 400/404/405/422/500 |
 | `integration/test_concurrency.py` | 4 | No overdraft (20 parallel requests against 6 × funds); no deadlock with retries disabled; conservation and reconciliation under a random storm; hot row returns 503 |
 | `integration/test_idempotency.py` | 8 | Replay; re-spelled replay; key reuse returns 422; declines aren't remembered; per-payer scope; 10 concurrent duplicates pay once |
+| `integration/test_migrations.py` | 2 | Upgrade → downgrade → upgrade on real Postgres; models match what the migrations create (a model changed back to `INTEGER` is caught) |
 
 The concurrency tests use **two separate engines**, standing in for two instances with separate pools, and a `Barrier` so the transactions really overlap. **I checked that the tests catch the bugs they claim to** by breaking the code on purpose:
 
@@ -143,7 +143,7 @@ The concurrency tests use **two separate engines**, standing in for two instance
 | Lock the payer first, then payees in request order | `DeadlockDetected` |
 | Look up the idempotency key before taking the lock | Duplicate-key violation under concurrent retries |
 
-CI (`.github/workflows/ci.yml`) runs lint, types and tests. A second job boots the Compose stack, sends the sample through nginx and runs the race demo.
+CI (`.github/workflows/ci.yml`) runs `make check`. A second job boots the Compose stack, sends the sample through nginx and runs the race demo, which is the concurrency gate under real parallel load. The rules any agent working in this repo follows (three gates, module boundaries, money invariants) are in [CLAUDE.md](CLAUDE.md). A Claude Code hook runs `make check` before any agent commit, and `.github/CODEOWNERS` assigns the money path to a human reviewer.
 
 **Browser end to end.** I drove Swagger UI on the running stack with `playwright-cli`, through nginx:
 - Executing the pre-filled sample 4 times gave 201, 201, 201 and then 422 `insufficient_funds`, with $10,246.25 available.
@@ -182,7 +182,8 @@ CI (`.github/workflows/ci.yml`) runs lint, types and tests. A second job boots t
 
 ## Possible improvements
 
-- **Auth:** bind the payer to the authenticated principal, and add per-firm rate limits.
+- **Auth, enforced twice:** bind the payer to the authenticated principal in the API, and again in the database: the transaction sets the caller's firm id and a policy refuses debits from any other firm. That way one forgotten check can't move another firm's money. Also add per-firm rate limits.
+- **Reconciliation:** a scheduled job that recomputes every balance from the ledger and alerts on any difference, so a silent mismatch surfaces in hours, not at month end.
 - **Ledger:** move to a double-entry ledger (immutable journal entries, with balances as a cached projection), plus `created_at` and a `bulk_payment_id` grouping each request's payments. That enables `GET /bulk_payments/{id}` and a `Location` header.
 - **Outbox:** a transactional outbox, so "you've been paid" notifications and webhooks are sent exactly when the payment commits.
 - **Hot payees:** a firm receiving from thousands of payers at once serialises on its row. Options are crediting through an append-only table aggregated asynchronously, or sharding the balance into sub-rows.
@@ -206,8 +207,9 @@ src/bulk_payments/
 migrations/    Alembic
 scripts/       seed.sql, sample_request.json, race_demo.py
 tests/         unit/ and integration/ (real Postgres)
+docs/specs/    the approved plan (0001) and the spec template
 ```
 
 ## How I worked
 
-The commit history is meant to be read in order: one step per commit, each explaining *why*. My tools and prompts are in [HOW_I_WORKED.md](HOW_I_WORKED.md).
+The commit history is meant to be read in order: one step per commit, each explaining *why*. The process (spec review, verification gate, diff review), my tools and my prompts are in [HOW_I_WORKED.md](HOW_I_WORKED.md). The plan behind commits 5–11 is committed verbatim as [spec 0001](docs/specs/0001-bulk-payment-service.md).
