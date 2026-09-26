@@ -1,4 +1,5 @@
 # The money path: mistakes here pay out the wrong amount instead of raising an error.
 /src/bulk_payments/service.py  @ppdevart-a11y
 /src/bulk_payments/money.py    @ppdevart-a11y
+/src/bulk_payments/schemas.py  @ppdevart-a11y
 /migrations/                   @ppdevart-a11y

@@ -11,4 +11,4 @@ dist/
 build/
 *.egg-info/
 .DS_Store
-.playwright-mcp/
+.playwright-cli/

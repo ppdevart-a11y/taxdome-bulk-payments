@@ -10,4 +10,4 @@
 
 ## Money path
 
-<!-- List every hunk in service.py, money.py or migrations/, and any change to locking. Mistakes there don't raise exceptions. -->
+<!-- List every hunk in service.py, money.py, schemas.py or migrations/, and any change to locking. Mistakes there don't raise exceptions. -->

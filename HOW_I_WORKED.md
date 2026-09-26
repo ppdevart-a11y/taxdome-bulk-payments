@@ -7,22 +7,22 @@ I work through three gates. Each catches a different kind of mistake, and the mo
 | Gate | What happened in this project |
 |---|---|
 | **1. Spec review** | Before commit 5, Claude read the repo in plan mode and asked clarifying questions about reset scope, schema, stack and tools. It then wrote a plan covering the steps, the files, the contracts affected, and how each step would be verified. I approved it before any of that code was written. The plan is committed verbatim as [spec 0001](docs/specs/0001-bulk-payment-service.md), and commits 5–11 carry the subjects it names. |
-| **2. Verification harness** | Lint and strict types were set up in commit 1, before any business code. From commit 5, when the first database tests landed, lint, types and the full suite against real PostgreSQL ran before every commit. That is now one command, `make check`: CI runs it, and a Claude Code hook runs it before any agent commit and blocks the commit if it fails. The tests were proven by breaking the code on purpose, and each break was caught:<br>• removing the row lock (the overdraft was stopped by the balance CHECK);<br>• locking payees in request order (deadlock);<br>• looking up the idempotency key before taking the lock (duplicate-key error under concurrent retries);<br>• changing a model back to `INTEGER` (drift caught).<br>The concurrency tests and the CI race job act as the load gate, because a test database with no parallel load hides locking bugs. |
-| **3. Review** | Claude re-read its own output before each commit. That caught a CI job that would have queried an unseeded database, and a README claim that didn't match what had actually happened. A final audit then probed the live stack the way a reviewer would, including driving Swagger UI in a real browser with `playwright-cli`. It found three gaps, which were fixed:<br>• a confusing 422 for `curl -d` sent without a Content-Type;<br>• nginx's body limit sitting below the API's own limits;<br>• Swagger UI pre-filled with firms that don't exist.<br>From that audit onward, nothing was committed without my explicit approval. I also reviewed `money.py` and `service.py` myself, and `.github/CODEOWNERS` now assigns those files and the migrations to me for review. |
+| **2. Verification harness** | Lint and strict types were set up in commit 1, before any business code. From commit 5, when the first database tests landed, lint, types and the full suite against real PostgreSQL ran before every commit. That is now one command, `make check`: CI runs it, and a Claude Code hook runs it before any agent commit and blocks the commit if it fails. The tests were proven by breaking the code on purpose, and each break was caught:<br>• removing the row lock (the overdraft was stopped by the balance CHECK);<br>• locking payees in request order (deadlock);<br>• looking up the idempotency key before taking the lock (duplicate-key error under concurrent retries);<br>• changing a model back to `INTEGER` (drift caught).<br>The pre-submission audit found four more breaks the suite didn't catch, and each now has a test that does ([spec 0002](docs/specs/0002-pre-submission-audit.md)).<br>The concurrency tests and the CI race job act as the load gate, because a test database with no parallel load hides locking bugs. |
+| **3. Review** | Claude re-read its own output before each commit. That caught a CI job that would have queried an unseeded database, and a README claim that didn't match what had actually happened. A final audit then probed the live stack the way a reviewer would, including driving Swagger UI in a real browser with `playwright-cli`. It found four gaps, which were fixed:<br>• a confusing 422 for `curl -d` sent without a Content-Type;<br>• nginx's body limit sitting below the API's own limits;<br>• Swagger UI pre-filled with firms that don't exist;<br>• 404, 405 and unexpected 500s not using the error envelope.<br>From that audit onward, nothing was committed without my explicit approval. I also reviewed `money.py` and `service.py` myself, and `.github/CODEOWNERS` now assigns the money path (those files, `schemas.py` and the migrations) to me for review. Before submission, a second audit had three independent reviewers look for what we had missed ([spec 0002](docs/specs/0002-pre-submission-audit.md)). |
 
 The harness dates from commit 1, and the spec was approved before commit 5. Writing the rules down came last, from what this build proved: each money rule in [CLAUDE.md](CLAUDE.md) names the test that holds it. Where each gate shows in the history:
 
-- **Spec:** [spec 0001](docs/specs/0001-bulk-payment-service.md), the plan behind commits 5–11 (added in commit 14).
-- **Harness:** commit 1 (ruff, strict mypy, pytest, no business code) → 5 (real PostgreSQL) → 6 (concurrency, proven by breaking the code) → 9 (CI and the race job) → 13 and 15 (migration checks, one `make check`, the commit hook).
-- **Review:** commit 12 (the audit's fixes) → 15 (code owners on the money path, a PR checklist).
+- **Spec:** [spec 0001](docs/specs/0001-bulk-payment-service.md), the plan behind commits 5–11 (added in commit 14), and [spec 0002](docs/specs/0002-pre-submission-audit.md), committed as commit 17 before any of the fixes it describes.
+- **Harness:** commit 1 (ruff, strict mypy, pytest, no business code) → 5 (real PostgreSQL) → 6 (concurrency, proven by breaking the code) → 9 (CI and the race job) → 13 and 15 (migration checks, one `make check`, the commit hook) → 20 (tests for four invariants nothing had pinned, each proven by a mutation).
+- **Review:** commit 12 (the audit's fixes) → 15 (code owners on the money path, a PR checklist) → 17–22 (the pre-submission audit).
 
 ## Tools
 
-I used one AI tool: **Claude Code** in the VS Code extension, running Claude Opus 5.5. It wrote the code, tests, infrastructure and docs, including the money path. In my own work I write money math by hand; here I let the agent write it and made the checks independent of the author instead: expected balances taken from the brief, tests proven by breaking the code on purpose, and my own review of that code. My part was scope and direction: which brief to follow, the stack, the deliverables and the bar for commit quality, plus the approvals at the gates. The engineering decisions and their reasoning are Claude's, and they're recorded in the commit messages and the README.
+I used one AI tool: **Claude Code** in the VS Code extension, running Claude Opus 5.5. It wrote the code, tests, infrastructure and docs, including the money path. In my own work I write money math by hand; here I let the agent write it and made the checks independent of the author instead: expected balances worked out by hand, tests proven by breaking the code on purpose, and my own review of that code. My part was scope and direction: which brief to follow, the stack, the deliverables and the bar for commit quality, plus the approvals at the gates. The engineering decisions and their reasoning are Claude's, and they're recorded in the commit messages and the README.
 
 ## Commit history
 
-Read it top to bottom. Each commit is one step, and its message explains why.
+Read it top to bottom. Each commit is one step, and every message after the scaffold explains why. Commits 13–16 were made together once I had approved them, and so were 17–22.
 
 | # | Commit | What it shows |
 |---|---|---|
@@ -42,6 +42,12 @@ Read it top to bottom. Each commit is one step, and its message explains why.
 | 14 | Add the approved plan as spec 0001 and a spec template | The plan behind commits 5–11, verbatim, and a template for the next change. |
 | 15 | Codify the three gates and enforce them for agents and reviewers | CLAUDE.md with each money rule tied to its test; `make check` in CI and before any agent commit; code owners on the money path. |
 | 16 | Trace each gate through the history and record the money-path review | Where each gate shows in the history, and my review of the money path. |
+| 17 | Add spec 0002 for the pre-submission audit | The findings, the decisions and the mutation evidence, before any fix. |
+| 18 | Pin CI actions, check Postgres over TCP, fix nginx host and body limit | CI could not have started, and a fresh volume could fail to boot. |
+| 19 | Answer every malformed request and busy pool with the right status | 415, 400 and 503 where the answers were 422, `bad_request` and 500. |
+| 20 | Pin the transaction's untested invariants with tests | Four mutations that left the suite green now fail it. |
+| 21 | Catch every spelling of git commit in the agent hook | `git -C "…" commit` no longer slips past the gate. |
+| 22 | Correct the docs after the pre-submission audit | A neutral voice, the real demo output, and claims that match the code. |
 
 ## Prompts
 
@@ -85,12 +91,19 @@ Prompts tidied for readability.
 **8. Final audit**
 > Before we call it done, recheck everything against the brief. Then verify the running stack end to end in a real browser with playwright-cli; passing tests alone aren't enough.
 
+*Claude:* rechecked the brief, then probed the live stack the way a reviewer would, including Swagger UI in a real browser. It found four gaps the tests had missed, fixed them, and verified the fixes through nginx.
+
 **9. Align with how I work**
 > Bring the repo in line with how I work: spec first, one verification gate, written rules for agents, and human review on the money path.
 
-*Claude:* wrote a spec first and built it after I approved: CLAUDE.md with the three gates, module boundaries and money invariants; one `make check` that CI also runs; and migration checks on real PostgreSQL.
+*Claude:* wrote a spec in the chat first and built it after I approved: CLAUDE.md with the three gates, module boundaries and money invariants; one `make check` that CI also runs; and migration checks on real PostgreSQL.
 
 **10. Challenge**
 > Don't settle for the first acceptable answer. What's the strongest version of this, and what's missing to get there?
 
 *Claude:* looked for evidence already in the repo before adding anything. The approved plan predates commit 5 and names commits 5–11, and commit 1 is the harness, so it committed the plan verbatim as spec 0001 and tied each money rule in CLAUDE.md to the test that holds it. It then added code owners on the money path, a PR checklist and a hook that blocks an agent's commit until `make check` passes. Nothing in the money path changed.
+
+**11. Pre-submission audit**
+> Re-audit the whole submission against the brief, requirement by requirement. Assume we missed something: hunt down the edge cases we haven't tested and pin every real one with a test.
+
+*Claude:* took the brief verbatim from the session. It ran three independent reviewers in parallel: one on money and the HTTP contract, one on concurrency, the database and deployment, and one on requirements and docs. It also ran the suite against deliberate mutations of `service.py`. It reproduced every finding before accepting it and wrote spec 0002. After I approved the spec, it fixed each finding and proved every new test by breaking the code once. Its own first lock-order test passed by coincidence, so the test now pins the query plan. The only money-path change is one `except` clause that turns a pool timeout into a 503.
