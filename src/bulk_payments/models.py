@@ -25,11 +25,16 @@ class Firm(Base):
         # Safety net under the application-level funds check: even a buggy code
         # path cannot leave a firm with a negative balance.
         CheckConstraint("balance_cents >= 0", name="firms_balance_non_negative"),
+        # Requests are normalised to this form before lookup; any other spelling would be unpayable.
+        CheckConstraint(
+            "uuid ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'",
+            name="firms_uuid_canonical",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     name: Mapped[str] = mapped_column(Text)
-    # BIGINT rather than the spec's INTEGER: a 4-byte Postgres INTEGER caps a
+    # BIGINT rather than the original INTEGER: a 4-byte Postgres INTEGER caps a
     # balance at $21,474,836.47, which a large practice can exceed.
     balance_cents: Mapped[int] = mapped_column(BigInteger)
     uuid: Mapped[str] = mapped_column(Text, unique=True)
