@@ -10,17 +10,20 @@ concurrency:
   cancel-in-progress: true
 
 # Actions are pinned by commit SHA. Tags can be moved, and setup-uv stopped
-# publishing major-version tags, so a ref like @v10 doesn't resolve.
+# publishing major-version tags, so a ref like @v10 doesn't resolve. The runner
+# image is pinned too, so a GitHub image migration can't change CI unannounced.
 jobs:
   checks:
     name: Verification gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
+          # One cache per job: two jobs saving the same key at once made one save fail.
+          cache-suffix: ${{ github.job }}
       - run: uv sync --frozen
       # The same gate that has to pass locally before a commit: lint, types,
       # migrations and every test. Integration tests start their own PostgreSQL
@@ -30,13 +33,15 @@ jobs:
 
   stack:
     name: Two replicas behind nginx, raced
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
+          # One cache per job: two jobs saving the same key at once made one save fail.
+          cache-suffix: ${{ github.job }}
       - run: uv sync --frozen
       - run: docker compose up --build --detach --wait
       - run: make seed
