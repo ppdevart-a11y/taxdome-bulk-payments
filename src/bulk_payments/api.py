@@ -1,3 +1,4 @@
+import json
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, Header, Request, Response, status
@@ -7,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from bulk_payments.db import get_session
-from bulk_payments.errors import UnsupportedMediaType
+from bulk_payments.errors import InvalidJson, UnsupportedMediaType
 from bulk_payments.schemas import BulkPaymentRequest, BulkPaymentResponse, ErrorResponse
 from bulk_payments.service import create_bulk_payment
 
@@ -15,8 +16,8 @@ router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
 
-# Pre-fills Swagger UI (/docs) with the brief's sample, so "Try it out" works on seeded data.
-_SPEC_SAMPLE: dict[str, Any] = {
+# Pre-fills Swagger UI (/docs) with scripts/sample_request.json: "Try it out" works on seeded data.
+_SAMPLE_REQUEST: dict[str, Any] = {
     "payer_firm_uuid": "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41",
     "payments": [
         {
@@ -38,7 +39,11 @@ _SPEC_SAMPLE: dict[str, Any] = {
 }
 BulkPaymentBody = Annotated[
     BulkPaymentRequest,
-    Body(openapi_examples={"brief": {"summary": "Sample from the brief", "value": _SPEC_SAMPLE}}),
+    Body(
+        openapi_examples={
+            "sample": {"summary": "Sample request for the seeded firms", "value": _SAMPLE_REQUEST}
+        }
+    ),
 ]
 IdempotencyKeyHeader = Annotated[
     str | None,
@@ -54,20 +59,34 @@ IdempotencyKeyHeader = Annotated[
 ]
 
 
-def require_json(request: Request) -> None:
-    """Reject non-JSON bodies with 415 rather than a confusing 422.
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise InvalidJson(f"key {key!r} appears more than once in the same object")
+        seen.add(key)
+    return dict(pairs)
 
-    FastAPI leaves a body sent as form data or with no Content-Type unparsed
-    (a CSRF safeguard), and validation then fails with "Input should be a valid
-    dictionary". On this endpoint 422 means "denied", so say what is wrong.
-    """
+
+async def require_json(request: Request) -> None:
+    """Answer 415 for a body FastAPI won't parse as JSON, and 400 for one that repeats a key."""
     media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
-    if media_type != "application/json" and not media_type.endswith("+json"):
+    # FastAPI parses only these; any other body fails validation as a 422, which here means denied.
+    parsed_as_json = media_type == "application/json" or (
+        media_type.startswith("application/") and media_type.endswith("+json")
+    )
+    if not parsed_as_json:
         raise UnsupportedMediaType("send the body as JSON with 'Content-Type: application/json'")
+    # FastAPI keeps the last of a repeated key; a body that states two amounts is refused.
+    if body := await request.body():
+        json.loads(body, object_pairs_hook=_reject_duplicate_keys)
 
 
 _ERRORS: dict[int | str, dict[str, Any]] = {
-    status.HTTP_400_BAD_REQUEST: {"model": ErrorResponse, "description": "Malformed JSON"},
+    status.HTTP_400_BAD_REQUEST: {
+        "model": ErrorResponse,
+        "description": "Body is not valid JSON, or repeats a key in an object",
+    },
     status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: {
         "model": ErrorResponse,
         "description": "Body not sent as application/json",
@@ -81,7 +100,10 @@ _ERRORS: dict[int | str, dict[str, Any]] = {
     },
     status.HTTP_503_SERVICE_UNAVAILABLE: {
         "model": ErrorResponse,
-        "description": "A firm is locked by another payment for too long; safe to retry",
+        "description": (
+            "A firm is locked by another payment for too long, or no database connection "
+            "came free. Nothing was written; safe to retry"
+        ),
     },
 }
 

@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, text
-from sqlalchemy.orm import Session
+from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.orm import Session, sessionmaker
 
 from bulk_payments.db import get_session
 from bulk_payments.main import create_app
@@ -148,14 +148,90 @@ def test_self_payment_is_rejected(client: TestClient) -> None:
     assert response.json()["error"]["details"][0]["type"] == "self_payment"
 
 
-def test_malformed_json_is_a_400(client: TestClient) -> None:
-    response = client.post(
-        "/bulk_payments",
-        content=b'{"payer_firm_uuid": ',
-        headers={"Content-Type": "application/json"},
-    )
+def post_raw(client: TestClient, body: bytes | str) -> Any:
+    return client.post("/bulk_payments", content=body, headers={"Content-Type": "application/json"})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b'{"payer_firm_uuid": ', id="syntax error"),
+        pytest.param(b'{"description": "\xff"}', id="invalid UTF-8"),
+        pytest.param(b"[" * 100_000, id="nesting too deep"),
+        pytest.param(b'{"amount": ' + b"1" * 5_000 + b"}", id="number too long"),
+    ],
+)
+def test_unparseable_body_is_a_400(client: TestClient, payments: Payments, body: bytes) -> None:
+    response = post_raw(client, body)
+
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_json"
+    assert payments() == []
+
+
+def test_repeated_key_is_refused_not_guessed(client: TestClient, payments: Payments) -> None:
+    # Python's parser keeps the last value, so this would otherwise pay $1,000.00.
+    body = (
+        f'{{"payer_firm_uuid": "{PINECREST}", "payments": [{{"amount": "1", "amount": "1000", '
+        f'"payee_firm_uuid": "{LOPEZ}", "description": "twice"}}]}}'
+    )
+
+    response = post_raw(client, body)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "code": "invalid_json",
+        "message": "key 'amount' appears more than once in the same object",
+    }
+    assert payments() == []
+
+
+def test_empty_body_is_a_validation_error(client: TestClient) -> None:
+    response = post_raw(client, b"")
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"] == [
+        {"field": "body", "type": "missing", "message": "Field required"}
+    ]
+
+
+def test_lone_surrogate_in_description_is_422(client: TestClient, payments: Payments) -> None:
+    # Valid JSON, but a lone "\ud800" is not a character Postgres can store.
+    body = json.dumps(pay(PINECREST, ("1", LOPEZ))).replace("payment 0", "a\\ud800b")
+
+    response = post_raw(client, body)
+
+    assert response.status_code == 422
+    assert [detail["field"] for detail in response.json()["error"]["details"]] == [
+        "payments.0.description"
+    ]
+    assert payments() == []
+
+
+def test_exhausted_pool_is_503_and_writes_nothing(
+    database_url: str, balances: Balances, payments: Payments
+) -> None:
+    engine = create_engine(database_url, pool_size=1, max_overflow=0, pool_timeout=0.2)
+    factory = sessionmaker(engine, expire_on_commit=False)
+
+    def session_override() -> Iterator[Session]:
+        with factory() as session:
+            yield session
+
+    app = create_app()
+    app.dependency_overrides[get_session] = session_override
+    try:
+        # Holding the pool's only connection leaves none for the request.
+        with engine.connect(), TestClient(app) as client:
+            response = client.post("/bulk_payments", json=SAMPLE_REQUEST)
+    finally:
+        engine.dispose()
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.json()["error"]["code"] == "service_busy"
+    assert balances() == SEED_BALANCES
+    assert payments() == []
 
 
 def test_health(client: TestClient) -> None:
@@ -166,7 +242,12 @@ def test_health(client: TestClient) -> None:
 
 @pytest.mark.parametrize(
     "content_type",
-    [None, "text/plain", "application/x-www-form-urlencoded"],  # curl -d sends the last one
+    [
+        None,
+        "text/plain",
+        "application/x-www-form-urlencoded",  # what curl -d sends
+        "text/plain+json",  # FastAPI parses only application/ types as JSON
+    ],
 )
 def test_body_not_sent_as_json_is_a_415_not_a_denial(
     client: TestClient, payments: Payments, content_type: str | None
@@ -214,7 +295,7 @@ def test_unexpected_errors_use_the_envelope_without_internals() -> None:
     assert response.json() == {"error": {"code": "internal_error", "message": "unexpected error"}}
 
 
-def test_swagger_example_is_the_brief_sample(client: TestClient) -> None:
+def test_swagger_example_is_the_sample_request(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     content = schema["paths"]["/bulk_payments"]["post"]["requestBody"]["content"]
-    assert content["application/json"]["examples"]["brief"]["value"] == SAMPLE_REQUEST
+    assert content["application/json"]["examples"]["sample"]["value"] == SAMPLE_REQUEST

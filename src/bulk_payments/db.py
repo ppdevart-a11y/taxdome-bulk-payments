@@ -14,6 +14,7 @@ def get_engine() -> Engine:
         settings.database_url,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout_s,
         pool_pre_ping=True,
     )
 

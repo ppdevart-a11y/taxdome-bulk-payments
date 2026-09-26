@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from bulk_payments.api import router
-from bulk_payments.errors import ServiceError
+from bulk_payments.errors import InvalidJson, ServiceError
 from bulk_payments.schemas import ErrorDetail, ErrorResponse
 
 
@@ -44,6 +44,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+        if exc.status_code == status.HTTP_400_BAD_REQUEST:
+            # FastAPI's catch-all for a body it couldn't decode: invalid UTF-8,
+            # nesting too deep, a number too long to convert. Same code as a syntax error.
+            return _error(exc.status_code, InvalidJson.code, "body is not valid JSON")
         # 404, 405 and friends use the same envelope as every other error.
         code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_")
         return _error(exc.status_code, code, str(exc.detail), headers=exc.headers)
@@ -52,7 +56,7 @@ def create_app() -> FastAPI:
     async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
         errors = exc.errors()
         if any(error["type"] == "json_invalid" for error in errors):
-            return _error(status.HTTP_400_BAD_REQUEST, "invalid_json", "body is not valid JSON")
+            return _error(status.HTTP_400_BAD_REQUEST, InvalidJson.code, "body is not valid JSON")
         details = [
             {
                 # ("body", "payments", 0, "amount") -> "payments.0.amount"

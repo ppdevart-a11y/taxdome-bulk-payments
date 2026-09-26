@@ -13,10 +13,17 @@ from dataclasses import dataclass
 import psycopg.errors
 from sqlalchemy import func, insert, select, text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session
 
 from bulk_payments.config import get_settings
-from bulk_payments.errors import FirmBusy, IdempotencyKeyReused, InsufficientFunds, UnknownFirms
+from bulk_payments.errors import (
+    FirmBusy,
+    IdempotencyKeyReused,
+    InsufficientFunds,
+    ServiceBusy,
+    UnknownFirms,
+)
 from bulk_payments.models import Firm, IdempotencyKey, Payment
 from bulk_payments.money import format_cents
 from bulk_payments.schemas import BulkPaymentRequest, BulkPaymentResponse, PaymentOut
@@ -52,6 +59,9 @@ def create_bulk_payment(
         try:
             with session.begin():
                 return _transfer(session, request, idempotency_key)
+        except PoolTimeoutError as exc:
+            # No connection came free, so nothing reached the database.
+            raise ServiceBusy("the service is busy, retry shortly") from exc
         except DBAPIError as exc:
             if isinstance(exc.orig, _BUSY):
                 raise FirmBusy(

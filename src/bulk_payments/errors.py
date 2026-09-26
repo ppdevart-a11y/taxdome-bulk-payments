@@ -32,8 +32,22 @@ class FirmBusy(ServiceError):
     code = "firm_busy"
 
 
+class ServiceBusy(ServiceError):
+    """No database connection came free in time. Nothing was written; safe to retry."""
+
+    status_code = 503
+    code = "service_busy"
+
+
 class UnsupportedMediaType(ServiceError):
     """The body wasn't sent as JSON. Kept apart from 422, which means "denied"."""
 
     status_code = 415
     code = "unsupported_media_type"
+
+
+class InvalidJson(ServiceError):
+    """The body isn't one unambiguous JSON document."""
+
+    status_code = 400
+    code = "invalid_json"
