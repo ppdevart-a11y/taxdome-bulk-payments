@@ -52,13 +52,18 @@ def database_url() -> Iterator[str]:
 
 
 @pytest.fixture(scope="session")
-def engine(database_url: str) -> Iterator[Engine]:
-    engine = create_engine(database_url, pool_size=30, max_overflow=0)
+def alembic_config() -> Config:
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "migrations"))
+    return config
+
+
+@pytest.fixture(scope="session")
+def engine(database_url: str, alembic_config: Config) -> Iterator[Engine]:
+    engine = create_engine(database_url, pool_size=30, max_overflow=0)
     with engine.begin() as connection:
-        config.attributes["connection"] = connection
-        command.upgrade(config, "head")
+        alembic_config.attributes["connection"] = connection
+        command.upgrade(alembic_config, "head")
     yield engine
     engine.dispose()
 
