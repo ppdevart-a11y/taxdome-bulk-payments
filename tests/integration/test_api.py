@@ -1,3 +1,4 @@
+import gzip
 import json
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from bulk_payments import api
 from bulk_payments.db import get_session
 from bulk_payments.main import create_app
 from bulk_payments.money import format_cents
@@ -26,7 +28,7 @@ def pay(payer: str, *lines: tuple[str, str]) -> dict[str, Any]:
     }
 
 
-def test_spec_sample_is_created_and_moves_money_exactly(
+def test_sample_is_created_and_moves_money_exactly(
     client: TestClient, balances: Balances, payments: Payments
 ) -> None:
     response = client.post("/bulk_payments", json=SAMPLE_REQUEST)
@@ -38,7 +40,7 @@ def test_spec_sample_is_created_and_moves_money_exactly(
     assert [p["amount"] for p in body["payments"]] == ["6250.00", "5800.50", "1200.75"]
     assert len({p["id"] for p in body["payments"]}) == 3
 
-    # The spec's expected balances: $36,748.75, $1,700.75 and $14,050.50.
+    # The sample's expected balances, worked out by hand: $36,748.75, $1,700.75, $14,050.50.
     assert balances() == {PINECREST: 3_674_875, LOPEZ: 170_075, NAIR: 1_405_050}
     assert payments() == [
         (1, 3, 625_000, "Overflow returns, August 2026"),
@@ -299,3 +301,56 @@ def test_swagger_example_is_the_sample_request(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     content = schema["paths"]["/bulk_payments"]["post"]["requestBody"]["content"]
     assert content["application/json"]["examples"]["sample"]["value"] == SAMPLE_REQUEST
+
+
+def test_the_applied_idempotency_key_is_echoed(client: TestClient, payments: Payments) -> None:
+    applied = client.post("/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency-Key": "k-1"})
+    # A misspelled header is ignored, and the missing echo is how a client can tell.
+    misspelled = client.post(
+        "/bulk_payments", json=SAMPLE_REQUEST, headers={"Idempotency_Key": "k-2"}
+    )
+
+    assert applied.status_code == 201
+    assert applied.headers["Idempotency-Key"] == "k-1"
+    assert misspelled.status_code == 201
+    assert "Idempotency-Key" not in misspelled.headers
+
+
+def test_head_health_answers_like_get(client: TestClient) -> None:
+    assert client.head("/health").status_code == 200
+
+
+def test_a_compressed_body_is_a_415(client: TestClient, payments: Payments) -> None:
+    response = client.post(
+        "/bulk_payments",
+        content=gzip.compress(json.dumps(SAMPLE_REQUEST).encode()),
+        headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
+    )
+
+    assert response.status_code == 415
+    assert response.json()["error"]["code"] == "unsupported_media_type"
+    assert payments() == []
+
+
+def test_a_parser_failure_is_a_400_never_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def overflow(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        raise RecursionError
+
+    monkeypatch.setattr(api, "_reject_duplicate_keys", overflow)
+
+    response = post_raw(client, json.dumps(SAMPLE_REQUEST))
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+
+
+def test_no_nesting_depth_near_the_parser_limit_is_a_500(client: TestClient) -> None:
+    # A second parse used to overflow a few levels earlier than FastAPI's, outside its handler.
+    statuses = {
+        post_raw(client, '{"a":' * depth + "1" + "}" * depth).status_code
+        for depth in range(9_950, 10_050)
+    }
+
+    assert 500 not in statuses

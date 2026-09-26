@@ -1,18 +1,19 @@
 import json
+from collections.abc import Callable, Coroutine
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, Header, Request, Response, status
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException
 
 from bulk_payments.db import get_session
-from bulk_payments.errors import InvalidJson, UnsupportedMediaType
+from bulk_payments.errors import UnsupportedMediaType
 from bulk_payments.schemas import BulkPaymentRequest, BulkPaymentResponse, ErrorResponse
 from bulk_payments.service import create_bulk_payment
-
-router = APIRouter()
 
 SessionDep = Annotated[Session, Depends(get_session)]
 
@@ -59,17 +60,53 @@ IdempotencyKeyHeader = Annotated[
 ]
 
 
+class DuplicateKey(HTTPException):
+    """A JSON object repeats a key. Starlette's type, so FastAPI's body parser lets it through."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(
+            status.HTTP_400_BAD_REQUEST, f"key {key!r} appears more than once in the same object"
+        )
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     seen: set[str] = set()
     for key, _ in pairs:
         if key in seen:
-            raise InvalidJson(f"key {key!r} appears more than once in the same object")
+            raise DuplicateKey(key)
         seen.add(key)
     return dict(pairs)
 
 
-async def require_json(request: Request) -> None:
-    """Answer 415 for a body FastAPI won't parse as JSON, and 400 for one that repeats a key."""
+class _StrictJSONRequest(Request):
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            if self.headers.get("content-encoding", "identity").lower() != "identity":
+                raise HTTPException(
+                    status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "send the body uncompressed"
+                )
+            # FastAPI keeps the last of a repeated key; a body that states two amounts is refused.
+            self._json = json.loads(await self.body(), object_pairs_hook=_reject_duplicate_keys)
+        return self._json
+
+
+class _StrictJSONRoute(APIRoute):
+    """FastAPI parses a JSON body once, through request.json(); this makes that one parse strict."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def strict_handler(request: Request) -> Response:
+            return await handler(_StrictJSONRequest(request.scope, request.receive))
+
+        return strict_handler
+
+
+router = APIRouter(route_class=_StrictJSONRoute)
+
+
+def require_json(request: Request) -> None:
+    """Answer 415 for a body FastAPI won't parse as JSON, rather than a confusing 422."""
     media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
     # FastAPI parses only these; any other body fails validation as a 422, which here means denied.
     parsed_as_json = media_type == "application/json" or (
@@ -77,9 +114,6 @@ async def require_json(request: Request) -> None:
     )
     if not parsed_as_json:
         raise UnsupportedMediaType("send the body as JSON with 'Content-Type: application/json'")
-    # FastAPI keeps the last of a repeated key; a body that states two amounts is refused.
-    if body := await request.body():
-        json.loads(body, object_pairs_hook=_reject_duplicate_keys)
 
 
 _ERRORS: dict[int | str, dict[str, Any]] = {
@@ -89,7 +123,7 @@ _ERRORS: dict[int | str, dict[str, Any]] = {
     },
     status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: {
         "model": ErrorResponse,
-        "description": "Body not sent as application/json",
+        "description": "Body not sent as uncompressed application/json",
     },
     status.HTTP_422_UNPROCESSABLE_CONTENT: {
         "model": ErrorResponse,
@@ -122,6 +156,9 @@ def post_bulk_payment(
     idempotency_key: IdempotencyKeyHeader = None,
 ) -> BulkPaymentResponse:
     outcome = create_bulk_payment(session, body, idempotency_key)
+    if idempotency_key is not None:
+        # Echoed so a client can tell its key was applied: a misspelled header is silently ignored.
+        response.headers["Idempotency-Key"] = idempotency_key
     if outcome.replayed:
         response.headers["Idempotent-Replayed"] = "true"
     return outcome.response
@@ -134,3 +171,7 @@ def health(session: SessionDep) -> JSONResponse:
     except SQLAlchemyError:
         return JSONResponse({"status": "database unavailable"}, status.HTTP_503_SERVICE_UNAVAILABLE)
     return JSONResponse({"status": "ok"})
+
+
+# Load balancers often probe with HEAD; FastAPI doesn't add it to a GET route.
+router.add_api_route("/health", health, methods=["HEAD"], include_in_schema=False)
