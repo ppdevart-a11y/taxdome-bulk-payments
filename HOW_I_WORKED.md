@@ -66,6 +66,7 @@ Read it top to bottom. Each commit is one step, and every message after the scaf
 | 38 | Catch chained, quoted and continued git commands in the commit hook | `git commit&&git push` and `git "commit"` no longer slip past the gate. |
 | 39 | Type-check tests and scripts, and hold the tests to the repo's rules | Strict mypy over everything, one money formatter, figures worked out by hand. |
 | 40 | Correct the docs after the fourth review | README, CLAUDE.md and this file, checked claim by claim. |
+| 41 | Answer the brief's closing questions in the README | Time spent, and how proud I am of the work. |
 
 ## Prompts
 

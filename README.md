@@ -379,3 +379,9 @@ docs/specs/    the approved plan (0001), the pre-submission audit (0002), the fa
 ## How I worked
 
 The commit history is meant to be read in order: one step per commit, and every commit after the scaffold explains *why* in its message. The process (spec review, verification gate, diff review), my tools and my prompts are in [HOW_I_WORKED.md](HOW_I_WORKED.md). The plan behind commits 5–11 is committed verbatim as [spec 0001](docs/specs/0001-bulk-payment-service.md), the pre-submission audit is [spec 0002](docs/specs/0002-pre-submission-audit.md), the production failure-mode review is [spec 0003](docs/specs/0003-production-failure-modes.md), and the fourth review is [spec 0004](docs/specs/0004-fourth-review.md).
+
+## Time and assessment
+
+**How much time did you spend on this task?** 3h to 6h, in short sessions over two days, which is why the commits span more than a day.
+
+**How proud are you of your work?** Very proud. The core is correct across instances: one transaction, ordered row locks, and the funds check under the lock. Every guarantee has a test that was shown to catch its removal. What's missing is listed under [Possible improvements](#possible-improvements), with auth first.
